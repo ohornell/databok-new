@@ -5,6 +5,7 @@ __pycache__/
 .Python
 venv/
 .venv/
+*.egg-info/
 
 # Cache
 .cache/
@@ -12,6 +13,7 @@ venv/
 
 # macOS
 .DS_Store
+._*
 
 # Excel temp files
 ~$*.xlsx
@@ -19,6 +21,17 @@ venv/
 # IDE
 .vscode/
 .idea/
+.claude/
+*.swp
+*.swo
 
-# Output files (optional - remove if you want to track generated files)
+# Environment variables
+.env
+.env.local
+
+# Output files
 *.xlsx
+
+# PDF reports (lägg till egna rapporter lokalt)
+reports/
+*_reports/

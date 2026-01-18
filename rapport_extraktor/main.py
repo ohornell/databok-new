@@ -7,59 +7,148 @@ skapar professionella Excel-databöcker.
 
 Användning:
     # Skapa ny databok från alla PDFs i en mapp
-    python main.py ./rapporter/ -o databok.xlsx
+    python main.py ./rapporter/ --company "Freemelt" -o databok.xlsx
 
     # Lägg till nya rapporter till befintlig databok
-    python main.py --update databok.xlsx --add ny_rapport.pdf
+    python main.py --company "Freemelt" --add ny_rapport.pdf -o databok.xlsx
 
-    # Rensa cache och extrahera allt på nytt
-    python main.py ./rapporter/ -o databok.xlsx --no-cache
+    # Generera Excel från databas (utan ny extraktion)
+    python main.py --company "Freemelt" --from-db -o databok.xlsx
+
+    # Lista alla bolag i databasen
+    python main.py --list-companies
 """
 
 import argparse
 import asyncio
 import sys
+import time
 from pathlib import Path
 
-from extractor import extract_all_pdfs, load_cached_extractions, clear_cache
+from dotenv import load_dotenv
+
+from extractor import extract_all_pdfs, load_cached_extractions
 from excel_builder import build_databook
+from supabase_client import list_companies, get_or_create_company, slugify, check_database_setup
+
+# Ladda miljövariabler
+load_dotenv()
 
 
-def create_progress_tracker(total: int):
+# Claude Sonnet 4 priser (USD per 1M tokens)
+PRICE_INPUT = 3.00   # $3 per 1M input tokens
+PRICE_OUTPUT = 15.00  # $15 per 1M output tokens
+USD_TO_SEK = 10.50   # Ungefärlig växelkurs
+
+
+def calculate_cost(input_tokens: int, output_tokens: int) -> float:
+    """Beräkna kostnad i SEK."""
+    usd = (input_tokens * PRICE_INPUT + output_tokens * PRICE_OUTPUT) / 1_000_000
+    return usd * USD_TO_SEK
+
+
+def format_time(seconds: float) -> str:
+    """Formatera sekunder till läsbar tid."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    mins = int(seconds // 60)
+    secs = int(seconds % 60)
+    return f"{mins}m {secs}s"
+
+
+def create_progress_tracker(pdf_paths: list[str]):
     """
-    Skapa progress-callback för terminal-output.
+    Skapa progress-callback för terminal-output med en rad per fil.
+    Visar tokens, kostnad och tid för varje fil.
     """
-    state = {"done": 0, "cached": 0, "failed": 0, "extracting": 0}
+    # Behåll ordning med lista av sökvägar
+    path_order = [str(p) for p in pdf_paths]
+    files = {str(p): {
+        "name": Path(p).name,
+        "status": "pending",
+        "input": 0,
+        "output": 0,
+        "start_time": None,
+        "elapsed": 0,
+    } for p in pdf_paths}
 
-    def on_progress(pdf_path: str, status: str):
-        filename = Path(pdf_path).name
+    state = {
+        "total_input_tokens": 0,
+        "total_output_tokens": 0,
+        "cached": 0,
+        "failed": 0,
+        "start_time": time.time(),
+    }
+
+    def render():
+        # Rensa och flytta cursor - använd fler rader för säkerhet
+        num_lines = len(files) + 2
+        sys.stdout.write(f"\033[{num_lines}A")  # Flytta upp
+        sys.stdout.write("\033[J")  # Rensa allt nedanför cursor
+
+        for path in path_order:
+            info = files[path]
+            if info["status"] == "pending":
+                icon = "[ ]"
+                details = ""
+            elif info["status"] == "extracting":
+                icon = "[~]"
+                elapsed = time.time() - info["start_time"] if info["start_time"] else 0
+                details = f"{format_time(elapsed)}"
+            elif info["status"] == "cached":
+                icon = "[C]"
+                details = "(cachad)"
+            elif info["status"] == "done":
+                icon = "[X]"
+                tokens = info["input"] + info["output"]
+                cost = calculate_cost(info["input"], info["output"])
+                details = f"{tokens:,} tok | {cost:.2f} kr | {format_time(info['elapsed'])}"
+            elif info["status"] == "failed":
+                icon = "[!]"
+                details = "fel"
+            else:
+                icon = "[?]"
+                details = ""
+
+            print(f"{icon} {info['name']:<35} {details}")
+
+        # Totalt
+        total_tokens = state["total_input_tokens"] + state["total_output_tokens"]
+        total_cost = calculate_cost(state["total_input_tokens"], state["total_output_tokens"])
+        elapsed = time.time() - state["start_time"]
+        print(f"    Totalt: {total_tokens:,} tokens | {total_cost:.2f} kr | {format_time(elapsed)}")
+        sys.stdout.flush()
+
+    def on_progress(pdf_path: str, status: str, token_info: dict | None = None):
+        path_key = str(pdf_path)
+        if path_key not in files:
+            return
 
         if status == "cached":
+            files[path_key]["status"] = "cached"
             state["cached"] += 1
-            state["done"] += 1
         elif status == "done":
-            state["done"] += 1
-            state["extracting"] = max(0, state["extracting"] - 1)
+            files[path_key]["status"] = "done"
+            if files[path_key]["start_time"]:
+                files[path_key]["elapsed"] = time.time() - files[path_key]["start_time"]
+            if token_info:
+                files[path_key]["input"] = token_info["input_tokens"]
+                files[path_key]["output"] = token_info["output_tokens"]
+                state["total_input_tokens"] += token_info["input_tokens"]
+                state["total_output_tokens"] += token_info["output_tokens"]
         elif status.startswith("failed"):
+            files[path_key]["status"] = "failed"
             state["failed"] += 1
-            state["done"] += 1
-            state["extracting"] = max(0, state["extracting"] - 1)
         elif status == "extracting":
-            state["extracting"] += 1
+            files[path_key]["status"] = "extracting"
+            files[path_key]["start_time"] = time.time()
 
-        # Progress bar
-        pct = (state["done"] / total) * 100
-        bar_width = 30
-        filled = int(bar_width * state["done"] / total)
-        bar = "█" * filled + "░" * (bar_width - filled)
+        render()
 
-        # Status line
-        status_text = f"[{bar}] {pct:5.1f}%  {state['done']}/{total}"
-        if state["extracting"] > 0:
-            status_text += f"  ⏳ {state['extracting']} pågående"
-
-        sys.stdout.write(f"\r{status_text:<70}")
-        sys.stdout.flush()
+    # Initial render - skapa plats för alla rader
+    for _ in range(len(files) + 2):
+        print()
+    render()
 
     return on_progress, state
 
@@ -70,9 +159,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exempel:
-  python main.py ./rapporter/ -o databok.xlsx
-  python main.py --update databok.xlsx --add q4_rapport.pdf
-  python main.py ./rapporter/ --no-cache -o ny_databok.xlsx
+  python main.py ./rapporter/ --company "Freemelt" -o databok.xlsx
+  python main.py --company "Freemelt" --add q4_rapport.pdf -o databok.xlsx
+  python main.py --company "Freemelt" --from-db -o databok.xlsx
+  python main.py --list-companies
         """
     )
 
@@ -88,17 +178,39 @@ Exempel:
         help="Output Excel-fil (default: databok.xlsx)"
     )
 
-    # Uppdatera befintlig databok
+    # Bolag (obligatoriskt för extraktion)
     parser.add_argument(
-        "--update",
-        metavar="XLSX",
-        help="Uppdatera befintlig databok"
+        "--company", "-c",
+        help="Bolagsnamn för datalagring i Supabase"
     )
+
+    # Lägg till nya rapporter
     parser.add_argument(
         "--add",
         nargs="+",
         metavar="PDF",
         help="PDF-filer att lägga till"
+    )
+
+    # Generera från databas
+    parser.add_argument(
+        "--from-db",
+        action="store_true",
+        help="Generera Excel från databas utan ny extraktion"
+    )
+
+    # Lista bolag
+    parser.add_argument(
+        "--list-companies",
+        action="store_true",
+        help="Lista alla bolag i databasen"
+    )
+
+    # Databassetup
+    parser.add_argument(
+        "--check-db",
+        action="store_true",
+        help="Verifiera att databasen är korrekt uppsatt"
     )
 
     # Övriga flaggor
@@ -107,25 +219,73 @@ Exempel:
         action="store_true",
         help="Ignorera cache, extrahera allt på nytt"
     )
-    parser.add_argument(
-        "--clear-cache",
-        action="store_true",
-        help="Rensa all cachad data"
-    )
 
     args = parser.parse_args()
 
-    # Rensa cache om begärt
-    if args.clear_cache:
-        clear_cache()
-        print("Cache rensad.")
-        if not args.pdf_dir and not args.update:
-            return
+    # === VERIFIERA DATABAS ===
+    if args.check_db:
+        ok, message = check_database_setup()
+        if ok:
+            print("✅ " + message)
+        else:
+            print(message)
+            sys.exit(1)
+        return
 
-    # === UPPDATERINGS-LÄGE ===
-    if args.update:
-        if not args.add:
-            print("❌ Ange PDF-filer att lägga till med --add")
+    # === LISTA BOLAG ===
+    if args.list_companies:
+        ok, message = check_database_setup()
+        if not ok:
+            print(message)
+            sys.exit(1)
+
+        companies = list_companies()
+        if not companies:
+            print("Inga bolag i databasen än.")
+        else:
+            print(f"{'Bolag':<30} {'Slug':<20}")
+            print("=" * 50)
+            for c in companies:
+                print(f"{c['name']:<30} {c['slug']:<20}")
+        return
+
+    # === GENERERA FRÅN DATABAS ===
+    if args.from_db:
+        if not args.company:
+            print("❌ Ange bolag med --company")
+            sys.exit(1)
+
+        ok, message = check_database_setup()
+        if not ok:
+            print(message)
+            sys.exit(1)
+
+        print(f"📊 Laddar data för {args.company} från Supabase...")
+        data = load_cached_extractions(args.company)
+
+        if not data:
+            print(f"❌ Ingen data hittades för {args.company}")
+            sys.exit(1)
+
+        normalize_tokens = build_databook(data, args.output)
+        print(f"✅ Databok skapad: {args.output}")
+        print(f"   Innehåller {len(data)} period(er)")
+
+        # Visa normaliseringskostnad
+        if normalize_tokens:
+            norm_cost = calculate_cost(normalize_tokens["input_tokens"], normalize_tokens["output_tokens"])
+            print(f"\n💰 Normaliseringskostnad: {norm_cost:.2f} kr")
+        return
+
+    # === LÄGG TILL NYA RAPPORTER ===
+    if args.add:
+        if not args.company:
+            print("❌ Ange bolag med --company")
+            sys.exit(1)
+
+        ok, message = check_database_setup()
+        if not ok:
+            print(message)
             sys.exit(1)
 
         # Verifiera att PDFs finns
@@ -137,16 +297,21 @@ Exempel:
                 sys.exit(1)
             add_paths.append(str(path))
 
-        print(f"📊 Uppdaterar {args.update} med {len(add_paths)} nya PDF(s)...\n")
+        print(f"📊 Lägger till {len(add_paths)} rapport(er) för {args.company}...\n")
 
-        # Ladda befintlig cachad data
-        existing = load_cached_extractions()
-        print(f"📁 Befintliga perioder i cache: {len(existing)}")
+        # Ladda befintlig data från Supabase
+        existing = load_cached_extractions(args.company)
+        print(f"📁 Befintliga perioder: {len(existing)}")
 
         # Extrahera nya PDFs
-        on_progress, state = create_progress_tracker(len(add_paths))
+        on_progress, state = create_progress_tracker(add_paths)
         new_results, failed = asyncio.run(
-            extract_all_pdfs(add_paths, on_progress, use_cache=not args.no_cache)
+            extract_all_pdfs(
+                add_paths,
+                args.company,
+                on_progress,
+                use_cache=not args.no_cache
+            )
         )
         print()  # Ny rad efter progress
 
@@ -155,13 +320,18 @@ Exempel:
             for path, error in failed:
                 print(f"   • {Path(path).name}: {error}")
 
-        # Kombinera och bygg om
+        # Kombinera och bygg Excel
         all_data = existing + new_results
         print(f"\n📈 Totalt {len(all_data)} perioder")
 
         if all_data:
-            build_databook(all_data, args.update)
-            print(f"✅ Databok uppdaterad: {args.update}")
+            normalize_tokens = build_databook(all_data, args.output)
+            print(f"✅ Databok uppdaterad: {args.output}")
+
+            # Visa normaliseringskostnad
+            if normalize_tokens:
+                norm_cost = calculate_cost(normalize_tokens["input_tokens"], normalize_tokens["output_tokens"])
+                print(f"\n💰 Normaliseringskostnad: {norm_cost:.2f} kr")
         else:
             print("❌ Ingen data att skriva")
 
@@ -170,6 +340,15 @@ Exempel:
     # === SKAPA NY DATABOK ===
     if not args.pdf_dir:
         parser.print_help()
+        sys.exit(1)
+
+    if not args.company:
+        print("❌ Ange bolag med --company")
+        sys.exit(1)
+
+    ok, message = check_database_setup()
+    if not ok:
+        print(message)
         sys.exit(1)
 
     pdf_dir = Path(args.pdf_dir)
@@ -184,37 +363,55 @@ Exempel:
         print(f"❌ Inga PDF-filer hittades i {args.pdf_dir}")
         sys.exit(1)
 
-    print(f"📄 Hittade {len(pdf_paths)} PDF-fil(er) i {args.pdf_dir}\n")
+    pdf_path_strs = [str(p) for p in pdf_paths]
+
+    print(f"📄 Hittade {len(pdf_paths)} PDF-fil(er) i {args.pdf_dir}")
+    print(f"🏢 Bolag: {args.company}")
 
     # Progress tracker
-    on_progress, state = create_progress_tracker(len(pdf_paths))
+    on_progress, state = create_progress_tracker(pdf_path_strs)
 
     # Kör extraktion
     successful, failed = asyncio.run(
         extract_all_pdfs(
-            [str(p) for p in pdf_paths],
+            pdf_path_strs,
+            args.company,
             on_progress,
             use_cache=not args.no_cache
         )
     )
-    print()  # Ny rad efter progress bar
+    print("\n")  # Ny rad efter progress bar
 
     # Sammanfattning
     print(f"\n{'═' * 50}")
     print(f"✅ Lyckades:  {len(successful)}")
     if state["cached"] > 0:
-        print(f"💾 Cachade:   {state['cached']}")
+        print(f"💾 Cachade:   {state['cached']} (0 kr)")
     if failed:
         print(f"❌ Fel:       {len(failed)}")
         print("\nMisslyckade filer:")
         for path, error in failed:
             print(f"   • {Path(path).name}: {error}")
 
+    # Kostnadssammanfattning
+    total_tokens = state["total_input_tokens"] + state["total_output_tokens"]
+    if total_tokens > 0:
+        total_cost = calculate_cost(state["total_input_tokens"], state["total_output_tokens"])
+        print(f"\n💰 Kostnad:")
+        print(f"   Input:  {state['total_input_tokens']:,} tokens")
+        print(f"   Output: {state['total_output_tokens']:,} tokens")
+        print(f"   Totalt: {total_cost:.2f} kr")
+
     # Bygg Excel
     if successful:
-        build_databook(successful, args.output)
+        normalize_tokens = build_databook(successful, args.output)
         print(f"\n📊 Databok skapad: {args.output}")
         print(f"   Innehåller {len(successful)} period(er)")
+
+        # Visa normaliseringskostnad
+        if normalize_tokens:
+            norm_cost = calculate_cost(normalize_tokens["input_tokens"], normalize_tokens["output_tokens"])
+            print(f"\n💰 Normaliseringskostnad: {norm_cost:.2f} kr")
     else:
         print("\n❌ Ingen data extraherades, ingen Excel skapad")
         sys.exit(1)

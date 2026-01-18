@@ -3,29 +3,98 @@ Excel-databok byggare med Investment Bank-formatering.
 Skapar professionellt formaterade finansiella rapporter.
 
 Förenklad version - endast resultaträkning, balansräkning och kassaflöde.
-Inkluderar radnormalisering för att matcha liknande radnamn mellan kvartal.
+Inkluderar AI-driven radnormalisering för att matcha liknande radnamn mellan kvartal.
 """
 
+import json
+import os
 import re
+
+from anthropic import Anthropic
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+
+from prompts import NORMALIZE_PROMPT
 
 
 def normalize_row_name(name: str) -> str:
     """
     Normalisera radnamn för jämförelse mellan kvartal.
-    Hanterar variationer som:
-    - "Accounts receivable" vs "Accounts receivables"
-    - "Stock options" vs "Employee stock options"
+    Enkel fallback om AI-normalisering inte används.
     """
     if not name:
         return ""
-    n = name.lower().strip()
-    # Ta bort trailing 's' för plural-variationer
-    if n.endswith('receivables'):
-        n = n[:-1]  # receivables -> receivable
-    return n
+    return name.lower().strip()
+
+
+def ai_normalize_rows(data_list: list[dict]) -> tuple[list[dict], dict | None]:
+    """
+    Använd AI för att normalisera alla radnamn till konsekventa svenska termer.
+    Detta körs en gång på all data innan Excel byggs.
+
+    Returns:
+        Tuple av (normaliserad data, token_info eller None)
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("⚠️  Ingen ANTHROPIC_API_KEY - hoppar över AI-normalisering")
+        return data_list, None
+
+    # Samla alla unika radnamn från alla rapporter
+    all_row_names = set()
+    for item in data_list:
+        for key in ["resultatrakning", "balansrakning", "kassaflodesanalys"]:
+            for row in item.get(key, []):
+                name = row.get("rad") or row.get("namn", "")
+                if name:
+                    all_row_names.add(name)
+
+    if not all_row_names:
+        return data_list, None
+
+    # Anropa Claude för att skapa mappning
+    print("🔄 Normaliserar radnamn med AI...")
+    client = Anthropic(api_key=api_key)
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=4096,
+            messages=[{
+                "role": "user",
+                "content": NORMALIZE_PROMPT.format(row_names=json.dumps(list(all_row_names), ensure_ascii=False, indent=2))
+            }]
+        )
+
+        # Token-info
+        token_info = {
+            "input_tokens": response.usage.input_tokens,
+            "output_tokens": response.usage.output_tokens,
+        }
+
+        # Parsa mappningen
+        text = response.content[0].text.strip()
+        if text.startswith("```"):
+            lines = text.split("\n")
+            text = "\n".join(lines[1:-1] if lines[-1] == "```" else lines[1:])
+
+        mapping = json.loads(text)
+
+        # Applicera mappningen på all data
+        for item in data_list:
+            for key in ["resultatrakning", "balansrakning", "kassaflodesanalys"]:
+                for row in item.get(key, []):
+                    old_name = row.get("rad") or row.get("namn", "")
+                    if old_name and old_name in mapping:
+                        row["rad"] = mapping[old_name]
+
+        print(f"✅ Normaliserade {len(mapping)} radnamn")
+        return data_list, token_info
+
+    except Exception as e:
+        print(f"⚠️  AI-normalisering misslyckades: {e}")
+        return data_list, None
 
 # ============================================
 # INVESTMENT BANK STYLE GUIDE
@@ -371,22 +440,28 @@ def populate_notes_sheet(ws, data_list: list[dict], company_name: str):
     ws.sheet_view.showGridLines = False
 
 
-def build_databook(extracted_data: list[dict], output_path: str):
+def build_databook(extracted_data: list[dict], output_path: str) -> dict | None:
     """
     Bygg komplett Excel-databok från extraherad data.
 
     Args:
         extracted_data: Lista med extraherad data från varje PDF
         output_path: Sökväg för output Excel-fil
+
+    Returns:
+        Token-info från AI-normalisering eller None
     """
     if not extracted_data:
         raise ValueError("Ingen data att bygga databok från")
+
+    # AI-normalisera radnamn för konsekvent formatering
+    normalized_data, normalize_tokens = ai_normalize_rows(extracted_data)
 
     wb = Workbook()
     wb.remove(wb.active)
 
     # Sortera data kronologiskt
-    sorted_data = sort_by_period(extracted_data)
+    sorted_data = sort_by_period(normalized_data)
     periods = [d.get("metadata", {}).get("period", "?") for d in sorted_data]
 
     # Hämta bolagsnamn
@@ -410,3 +485,5 @@ def build_databook(extracted_data: list[dict], output_path: str):
 
     # Spara
     wb.save(output_path)
+
+    return normalize_tokens

@@ -1,12 +1,11 @@
 """
 Async PDF-extraktion via Claude API.
-Skalbar för 30+ PDF-filer med caching och progress-tracking.
+Skalbar för 30+ PDF-filer med Supabase-caching och progress-tracking.
 """
 
 import asyncio
 import base64
 import json
-import hashlib
 import os
 import re
 from pathlib import Path
@@ -15,21 +14,18 @@ from typing import Callable
 from anthropic import AsyncAnthropic
 
 from prompts import EXTRACTION_PROMPT
+from supabase_client import (
+    get_or_create_company,
+    period_exists,
+    save_period,
+    load_all_periods,
+    get_pdf_hash,
+    parse_period_string,
+)
 
 # Konfiguration
 MAX_CONCURRENT = 5  # Max samtidiga API-anrop (rate limit-vänlig)
 MAX_RETRIES = 3     # Antal retry vid fel
-CACHE_DIR = Path(".cache")
-
-
-def get_cache_path(pdf_path: str) -> Path:
-    """
-    Generera unik cache-sökväg baserad på PDF-innehållets hash.
-    Detta säkerställer att ändrade PDFs får ny cache.
-    """
-    pdf_bytes = Path(pdf_path).read_bytes()
-    pdf_hash = hashlib.md5(pdf_bytes).hexdigest()[:12]
-    return CACHE_DIR / f"{Path(pdf_path).stem}_{pdf_hash}.json"
 
 
 def parse_json_response(response_text: str) -> dict:
@@ -65,7 +61,8 @@ async def extract_pdf(
     pdf_path: str,
     client: AsyncAnthropic,
     semaphore: asyncio.Semaphore,
-    progress_callback: Callable[[str, str], None] | None = None,
+    company_id: str,
+    progress_callback: Callable[[str, str, dict | None], None] | None = None,
     use_cache: bool = True
 ) -> dict:
     """
@@ -75,25 +72,38 @@ async def extract_pdf(
         pdf_path: Sökväg till PDF-filen
         client: Anthropic async-klient
         semaphore: Begränsar antal samtidiga anrop
-        progress_callback: Callback för progress (pdf_path, status)
+        company_id: Bolagets UUID i Supabase
+        progress_callback: Callback för progress (pdf_path, status, token_info)
         use_cache: Om True, använd cachad data om tillgänglig
 
     Returns:
         Dict med extraherad data
     """
-    cache_path = get_cache_path(pdf_path)
+    pdf_hash = get_pdf_hash(pdf_path)
 
-    # Returnera cachad data om den finns
-    if use_cache and cache_path.exists():
-        if progress_callback:
-            progress_callback(pdf_path, "cached")
-        data = json.loads(cache_path.read_text())
-        data["_source_file"] = str(pdf_path)
-        return data
+    # Kontrollera Supabase-cache
+    if use_cache:
+        # Försök hitta befintlig period med matchande hash
+        # Vi behöver först extrahera för att veta period, så vi gör en snabb check
+        # baserat på filnamnet om möjligt
+        filename = Path(pdf_path).stem
+        period_match = re.search(r'[qQ](\d)[_-]?(\d{4})', filename)
+        if period_match:
+            quarter = int(period_match.group(1))
+            year = int(period_match.group(2))
+            if period_exists(company_id, quarter, year, pdf_hash):
+                if progress_callback:
+                    progress_callback(pdf_path, "cached", None)
+                # Ladda från Supabase
+                from supabase_client import load_period
+                data = load_period(company_id, quarter, year)
+                if data:
+                    data["_source_file"] = str(pdf_path)
+                    return data
 
     async with semaphore:
         if progress_callback:
-            progress_callback(pdf_path, "extracting")
+            progress_callback(pdf_path, "extracting", None)
 
         # Läs PDF som base64
         pdf_bytes = Path(pdf_path).read_bytes()
@@ -128,14 +138,17 @@ async def extract_pdf(
                 result = parse_json_response(response.content[0].text)
                 result["_source_file"] = str(pdf_path)
 
-                # Spara till cache
-                CACHE_DIR.mkdir(exist_ok=True)
-                cache_path.write_text(
-                    json.dumps(result, ensure_ascii=False, indent=2)
-                )
+                # Token-info från API-svaret
+                token_info = {
+                    "input_tokens": response.usage.input_tokens,
+                    "output_tokens": response.usage.output_tokens,
+                }
+
+                # Spara till Supabase
+                save_period(company_id, result, pdf_hash, str(pdf_path))
 
                 if progress_callback:
-                    progress_callback(pdf_path, "done")
+                    progress_callback(pdf_path, "done", token_info)
 
                 return result
 
@@ -147,7 +160,7 @@ async def extract_pdf(
                     await asyncio.sleep(wait_time)
                 else:
                     if progress_callback:
-                        progress_callback(pdf_path, f"failed: {e}")
+                        progress_callback(pdf_path, f"failed: {e}", None)
                     raise
 
         raise last_error  # type: ignore
@@ -155,6 +168,7 @@ async def extract_pdf(
 
 async def extract_all_pdfs(
     pdf_paths: list[str],
+    company_name: str,
     on_progress: Callable[[str, str], None] | None = None,
     use_cache: bool = True
 ) -> tuple[list[dict], list[tuple[str, Exception]]]:
@@ -163,6 +177,7 @@ async def extract_all_pdfs(
 
     Args:
         pdf_paths: Lista med sökvägar till PDF-filer
+        company_name: Bolagsnamn för datalagring
         on_progress: Callback för progress-uppdateringar
         use_cache: Om True, använd cachad data
 
@@ -175,13 +190,18 @@ async def extract_all_pdfs(
             "ANTHROPIC_API_KEY saknas. "
             "Exportera den med: export ANTHROPIC_API_KEY='din-nyckel'"
         )
+
+    # Hämta eller skapa bolag i Supabase
+    company = get_or_create_company(company_name)
+    company_id = company["id"]
+
     client = AsyncAnthropic(api_key=api_key)
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
     async def safe_extract(path: str):
         """Wrapper som fångar fel istället för att krascha"""
         try:
-            return await extract_pdf(path, client, semaphore, on_progress, use_cache)
+            return await extract_pdf(path, client, semaphore, company_id, on_progress, use_cache)
         except Exception as e:
             return (path, e)
 
@@ -195,28 +215,9 @@ async def extract_all_pdfs(
     return successful, failed
 
 
-def load_cached_extractions() -> list[dict]:
+def load_cached_extractions(company_name: str) -> list[dict]:
     """
-    Ladda alla tidigare cachade extraktioner.
-    Användbart för --update läge.
+    Ladda alla tidigare extraktioner för ett bolag från Supabase.
     """
-    if not CACHE_DIR.exists():
-        return []
-
-    cached = []
-    for cache_file in CACHE_DIR.glob("*.json"):
-        try:
-            data = json.loads(cache_file.read_text())
-            cached.append(data)
-        except (json.JSONDecodeError, IOError):
-            # Hoppa över korrupt cache
-            pass
-
-    return cached
-
-
-def clear_cache():
-    """Rensa all cachad data"""
-    if CACHE_DIR.exists():
-        for f in CACHE_DIR.glob("*.json"):
-            f.unlink()
+    company = get_or_create_company(company_name)
+    return load_all_periods(company["id"])
