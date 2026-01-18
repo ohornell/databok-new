@@ -1,0 +1,307 @@
+{
+  "metadata": {
+    "bolag": "Vitrolife AB (publ)",
+    "period": "Q3 2025",
+    "valuta": "MSEK"
+  },
+  "resultatrakning": [
+    {
+      "rad": "Nettoomsättning",
+      "varde": 835
+    },
+    {
+      "rad": "Kostnad för sålda varor",
+      "varde": -343
+    },
+    {
+      "rad": "Bruttoresultat",
+      "varde": 492,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "Försäljningskostnader",
+      "varde": -191
+    },
+    {
+      "rad": "Administrationskostnader",
+      "varde": -120
+    },
+    {
+      "rad": "Forsknings- och utvecklingskostnader",
+      "varde": -27
+    },
+    {
+      "rad": "Övriga rörelseintäkter",
+      "varde": 1
+    },
+    {
+      "rad": "Övriga rörelsekostnader",
+      "varde": -11
+    },
+    {
+      "rad": "Rörelseresultat",
+      "varde": 144,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "Finansiella intäkter och kostnader",
+      "varde": -13
+    },
+    {
+      "rad": "Resultat efter finansiella poster",
+      "varde": 131,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "Inkomstskatter",
+      "varde": -29
+    },
+    {
+      "rad": "Nettoresultat",
+      "varde": 102,
+      "typ": "total"
+    }
+  ],
+  "balansrakning": [
+    {
+      "rad": "Goodwill",
+      "varde": 9836
+    },
+    {
+      "rad": "Övriga immateriella anläggningstillgångar",
+      "varde": 4031
+    },
+    {
+      "rad": "Materiella anläggningstillgångar",
+      "varde": 435
+    },
+    {
+      "rad": "Övriga finansiella anläggningstillgångar",
+      "varde": 87
+    },
+    {
+      "rad": "Uppskjutna skattefordringar",
+      "varde": 155
+    },
+    {
+      "rad": "Summa anläggningstillgångar",
+      "varde": 14544,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "Varulager",
+      "varde": 428
+    },
+    {
+      "rad": "Kundfordringar",
+      "varde": 617
+    },
+    {
+      "rad": "Aktuella skattefordringar",
+      "varde": 46
+    },
+    {
+      "rad": "Övriga fordringar",
+      "varde": 51
+    },
+    {
+      "rad": "Förutbetalda kostnader och upplupna intäkter",
+      "varde": 58
+    },
+    {
+      "rad": "Likvida medel",
+      "varde": 1109
+    },
+    {
+      "rad": "Summa omsättningstillgångar",
+      "varde": 2310,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "Summa tillgångar",
+      "varde": 16854,
+      "typ": "total"
+    },
+    {
+      "rad": "Eget kapital hänförligt till moderbolagets aktieägare",
+      "varde": 13300
+    },
+    {
+      "rad": "Innehav utan bestämmande inflytande",
+      "varde": 1
+    },
+    {
+      "rad": "Summa eget kapital",
+      "varde": 13302,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "Avsättningar",
+      "varde": 54
+    },
+    {
+      "rad": "Uppskjutna skatteskulder",
+      "varde": 976
+    },
+    {
+      "rad": "Upptagna lån",
+      "varde": 1879
+    },
+    {
+      "rad": "Leasingskulder",
+      "varde": 78
+    },
+    {
+      "rad": "Övriga skulder",
+      "varde": 42
+    },
+    {
+      "rad": "Summa långfristiga skulder",
+      "varde": 3028,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "Upptagna lån",
+      "varde": null
+    },
+    {
+      "rad": "Leasingskulder",
+      "varde": 45
+    },
+    {
+      "rad": "Leverantörsskulder",
+      "varde": 167
+    },
+    {
+      "rad": "Aktuella skatteskulder",
+      "varde": 25
+    },
+    {
+      "rad": "Övriga skulder",
+      "varde": 79
+    },
+    {
+      "rad": "Upplupna kostnader och förutbetalda intäkter",
+      "varde": 208
+    },
+    {
+      "rad": "Summa kortfristiga skulder",
+      "varde": 525,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "Summa skulder",
+      "varde": 3553,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "Summa eget kapital och skulder",
+      "varde": 16854,
+      "typ": "total"
+    }
+  ],
+  "kassaflodesanalys": [
+    {
+      "rad": "Resultat efter finansiella poster",
+      "varde": 131
+    },
+    {
+      "rad": "Justeringar för poster som inte ingår i kassaflödet",
+      "varde": 117
+    },
+    {
+      "rad": "Betald skatt",
+      "varde": -30
+    },
+    {
+      "rad": "Förändring av varulager",
+      "varde": 0
+    },
+    {
+      "rad": "Förändring av rörelsefordringar",
+      "varde": 35
+    },
+    {
+      "rad": "Förändring av rörelseskulder",
+      "varde": 1
+    },
+    {
+      "rad": "Kassaflöde från den löpande verksamheten",
+      "varde": 255,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "Förvärv av rörelse, efter avdrag för likvida medel",
+      "varde": null
+    },
+    {
+      "rad": "Inkråmsförvärv",
+      "varde": null
+    },
+    {
+      "rad": "Kassaflöde från förlust av bestämmande inflytande",
+      "varde": null
+    },
+    {
+      "rad": "Nettoinvesteringar i anläggningstillgångar",
+      "varde": -58
+    },
+    {
+      "rad": "Tilläggsköpeskilling",
+      "varde": null
+    },
+    {
+      "rad": "Kassaflöde från investeringsverksamheten",
+      "varde": -58,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "Amortering av låneskulder",
+      "varde": -1841
+    },
+    {
+      "rad": "Upptagna lån",
+      "varde": 1870
+    },
+    {
+      "rad": "Uppläggningsavgifter lån",
+      "varde": -11
+    },
+    {
+      "rad": "Förändring i checkkredit/kreditlimit",
+      "varde": null
+    },
+    {
+      "rad": "Amortering av leasingskulder",
+      "varde": -13
+    },
+    {
+      "rad": "Utbetald utdelning",
+      "varde": null
+    },
+    {
+      "rad": "Kassaflöde från finansieringsverksamheten",
+      "varde": 6,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "Periodens kassaflöde",
+      "varde": 203,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "Likvida medel vid periodens början",
+      "varde": 921
+    },
+    {
+      "rad": "Kursdifferens i likvida medel",
+      "varde": -16
+    },
+    {
+      "rad": "Likvida medel vid periodens slut",
+      "varde": 1109,
+      "typ": "total"
+    }
+  ],
+  "_source_file": "../vitrolife_reports/vitrolife-q3-2025.pdf"
+}

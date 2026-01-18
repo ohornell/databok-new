@@ -1,0 +1,286 @@
+{
+  "metadata": {
+    "bolag": "Freemelt Holding AB (publ)",
+    "period": "Q3 2025",
+    "valuta": "KSEK"
+  },
+  "resultatrakning": [
+    {
+      "rad": "Net sales",
+      "varde": 16988
+    },
+    {
+      "rad": "Activated work for own account",
+      "varde": 2998
+    },
+    {
+      "rad": "Other operating income",
+      "varde": 1403
+    },
+    {
+      "rad": "Sum income",
+      "varde": 21389,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "Trade goods",
+      "varde": -8430
+    },
+    {
+      "rad": "Other external costs",
+      "varde": -7601
+    },
+    {
+      "rad": "Personnel costs",
+      "varde": -11066
+    },
+    {
+      "rad": "Depreciation tangible and intagible assets",
+      "varde": -14910
+    },
+    {
+      "rad": "Other operating expenses",
+      "varde": -734
+    },
+    {
+      "rad": "Sum operating expenses",
+      "varde": -42741,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "Operating result",
+      "varde": -21352,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "Interest income and similar items",
+      "varde": 183
+    },
+    {
+      "rad": "Interest expense and similar items",
+      "varde": -2
+    },
+    {
+      "rad": "Sum financial items",
+      "varde": 181,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "Result after financial items",
+      "varde": -21171,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "Tax on the period's results",
+      "varde": 0
+    },
+    {
+      "rad": "RESULT FOR THE PERIOD",
+      "varde": -21171,
+      "typ": "total"
+    }
+  ],
+  "balansrakning": [
+    {
+      "rad": "Goodwill",
+      "varde": 46401
+    },
+    {
+      "rad": "Balanced development work",
+      "varde": 91804
+    },
+    {
+      "rad": "Patents",
+      "varde": 5214
+    },
+    {
+      "rad": "Total intangible assets",
+      "varde": 143419,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "Machinery and other technical facilities",
+      "varde": 9937
+    },
+    {
+      "rad": "Equipment, tools and installations",
+      "varde": 1170
+    },
+    {
+      "rad": "Total tangible assets",
+      "varde": 11107,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "Deferred tax claim",
+      "varde": 5230
+    },
+    {
+      "rad": "Total non-current assets",
+      "varde": 159756,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "Raw materials, consumables, trade goods",
+      "varde": 18719
+    },
+    {
+      "rad": "Accounts receivables",
+      "varde": 7646
+    },
+    {
+      "rad": "Other receivables",
+      "varde": 2021
+    },
+    {
+      "rad": "Prepaid expenses and accrued income",
+      "varde": 2753
+    },
+    {
+      "rad": "Cash and bank balances",
+      "varde": 45081
+    },
+    {
+      "rad": "Total current assets",
+      "varde": 76220,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "TOTAL ASSETS",
+      "varde": 235976,
+      "typ": "total"
+    },
+    {
+      "rad": "Share capital",
+      "varde": 9438
+    },
+    {
+      "rad": "Other capital contributed",
+      "varde": 533830
+    },
+    {
+      "rad": "Other equity including this year's result",
+      "varde": -328724
+    },
+    {
+      "rad": "Total equity",
+      "varde": 214544,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "Other liabilities",
+      "varde": 0
+    },
+    {
+      "rad": "Accounts payables",
+      "varde": 9233
+    },
+    {
+      "rad": "Tax liabilities",
+      "varde": 411
+    },
+    {
+      "rad": "Other liabilities",
+      "varde": 1721
+    },
+    {
+      "rad": "Accrued costs and prepaid income",
+      "varde": 10067
+    },
+    {
+      "rad": "Total current liabilities",
+      "varde": 21432,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "TOTAL EQUITY AND LIABILITIES",
+      "varde": 235976,
+      "typ": "total"
+    }
+  ],
+  "kassaflodesanalys": [
+    {
+      "rad": "Result after financial items",
+      "varde": -21171
+    },
+    {
+      "rad": "Adjustments for items not affecting cash flow",
+      "varde": 14909
+    },
+    {
+      "rad": "Cash flow from operating activities before changes in working capital",
+      "varde": -6262,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "Increase (-)/Decrease (+) Inventory",
+      "varde": 2187
+    },
+    {
+      "rad": "Increase (-)/Decrease (+) Receivables",
+      "varde": 11601
+    },
+    {
+      "rad": "Increase (+)/Decrease (-) Payables",
+      "varde": -7695
+    },
+    {
+      "rad": "Net cash from operating activities",
+      "varde": -169,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "Investments in intangible fixed assets",
+      "varde": -3775
+    },
+    {
+      "rad": "Investments in tangible fixed assets",
+      "varde": -5194
+    },
+    {
+      "rad": "Net cash from investing activities",
+      "varde": -8969,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "Share issue",
+      "varde": 0
+    },
+    {
+      "rad": "Stock options",
+      "varde": 0
+    },
+    {
+      "rad": "Employee stock options",
+      "varde": 262
+    },
+    {
+      "rad": "Short term liabilities",
+      "varde": 0
+    },
+    {
+      "rad": "Cash flow from financing activities",
+      "varde": 262,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "Cash flow for the period",
+      "varde": -8876,
+      "typ": "subtotal"
+    },
+    {
+      "rad": "Cash and cash equivalents at beg. of period",
+      "varde": 53984
+    },
+    {
+      "rad": "Exchange rate diff. in cash and cash equivalents",
+      "varde": -27
+    },
+    {
+      "rad": "CASH AND CASH EQUIVALENTS END OF PERIOD",
+      "varde": 45081,
+      "typ": "total"
+    }
+  ],
+  "_source_file": "../reports/freemelt-q3-2025.pdf"
+}
