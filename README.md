@@ -13,6 +13,7 @@ Extraherar finansiell data från PDF-kvartalsrapporter och skapar professionella
 
 ## Funktioner
 
+### Grundläggande
 - Automatisk extraktion av finansiell data från PDF-rapporter via Claude API
 - Stöd för resultaträkning, balansräkning och kassaflödesanalys
 - Professionellt formaterad Excel-output (Goldman Sachs-inspirerad stil)
@@ -21,6 +22,12 @@ Extraherar finansiell data från PDF-kvartalsrapporter och skapar professionella
 - Smart caching - redan extraherade rapporter hämtas från databasen
 - Token-tracking i realtid med kostnadssammanfattning efter körning
 - Smart AI-driven radnormalisering för att matcha liknande radnamn mellan kvartal
+
+### Full extraktion (`--full`)
+- Extraherar ALL text från rapporten (VD-ord, marknadsöversikt, verksamhetsbeskrivning etc.)
+- Extraherar ALLA tabeller (koncern, moderbolag, nyckeltal, segment)
+- Extraherar grafer/diagram med datapunkter (stapel, linje, cirkel, yta)
+- Separata Excel-flikar för textsektioner och grafer
 
 ## Installation
 
@@ -61,6 +68,12 @@ export ANTHROPIC_API_KEY='din-nyckel'
 
 ```bash
 python main.py ./rapporter/ --company "Freemelt" -o databok.xlsx
+```
+
+### Full extraktion (text, alla tabeller, grafer)
+
+```bash
+python main.py ./rapporter/ --company "Freemelt" -o databok.xlsx --full
 ```
 
 Output:
@@ -111,6 +124,12 @@ Endast Q4 extraheras (kostar tokens), Q1-Q3 laddas från databasen (gratis).
 
 ```bash
 python main.py --company "Freemelt" --from-db -o databok.xlsx
+```
+
+### Filtrera på specifika perioder
+
+```bash
+python main.py --company "Freemelt" --from-db -o databok.xlsx --period "Q1 2025" "Q2 2025"
 ```
 
 ### Lista alla bolag i databasen
@@ -194,6 +213,11 @@ python main.py ./rapporter/ --company "Freemelt" -o databok.xlsx --no-cache
                │  • Resultaträkning       │
                │  • Balansräkning         │
                │  • Kassaflöde            │
+               │  (med --full:)           │
+               │  • Grafer                │
+               │  • VD-ord                │
+               │  • Marknadsöversikt      │
+               │  • ...fler textsektioner │
                └──────────────────────────┘
 ```
 
@@ -230,12 +254,30 @@ companies (1) ─────< periods (N) ─────< financial_data (N)
                         ├─ year              ├─ row_name
                         ├─ pdf_hash          ├─ value
                         └─ valuta            └─ row_type
+
+                    periods (1) ─────< sections (N)        -- Textsektioner
+                                       ├─ title
+                                       ├─ page_number
+                                       ├─ section_type
+                                       └─ content
+
+                    periods (1) ─────< report_tables (N)   -- Alla tabeller (JSONB)
+                                       ├─ title
+                                       ├─ table_type
+                                       ├─ columns (JSONB)
+                                       └─ rows (JSONB)
+
+                    periods (1) ─────< charts (N)          -- Grafer/diagram
+                                       ├─ title
+                                       ├─ chart_type
+                                       ├─ estimated
+                                       └─ data_points (JSONB)
 ```
 
 ## Kostnader
 
 Verktyget använder Claude Sonnet 4 för:
-1. **PDF-extraktion** - extraherar finansiell data från varje PDF (~1-2 kr/rapport)
+1. **PDF-extraktion** - extraherar finansiell data från varje PDF (~1-2 kr/rapport, ~4-5 kr med `--full`)
 2. **Radnormalisering** - matchar radnamn mellan kvartal för konsekvent Excel (~0.10-0.20 kr/körning)
 
 Kostnaden visas i realtid under körning och summeras efteråt.
