@@ -38,16 +38,50 @@ from supabase_client import list_companies, get_or_create_company, slugify, chec
 load_dotenv()
 
 
-# Claude Sonnet 4 priser (USD per 1M tokens)
-PRICE_INPUT = 3.00   # $3 per 1M input tokens
-PRICE_OUTPUT = 15.00  # $15 per 1M output tokens
+# Token-priser (USD per 1M tokens)
+HAIKU_INPUT_PRICE = 0.80   # $0.80 per 1M input tokens
+HAIKU_OUTPUT_PRICE = 4.00  # $4.00 per 1M output tokens
+SONNET_INPUT_PRICE = 3.00  # $3.00 per 1M input tokens
+SONNET_OUTPUT_PRICE = 15.00  # $15.00 per 1M output tokens
 USD_TO_SEK = 10.50   # Ungefärlig växelkurs
 
 
-def calculate_cost(input_tokens: int, output_tokens: int) -> float:
-    """Beräkna kostnad i SEK."""
-    usd = (input_tokens * PRICE_INPUT + output_tokens * PRICE_OUTPUT) / 1_000_000
+def calculate_cost(input_tokens: int, output_tokens: int, model: str = "sonnet") -> float:
+    """Beräkna kostnad i SEK baserat på modell."""
+    if model == "haiku":
+        usd = (input_tokens * HAIKU_INPUT_PRICE + output_tokens * HAIKU_OUTPUT_PRICE) / 1_000_000
+    else:
+        usd = (input_tokens * SONNET_INPUT_PRICE + output_tokens * SONNET_OUTPUT_PRICE) / 1_000_000
     return usd * USD_TO_SEK
+
+
+def print_pipeline_details(results: list[dict]):
+    """Visa detaljerad timing och kostnad per pass för multi-pass extraktion."""
+    for result in results:
+        pipeline_info = result.get("_pipeline_info")
+        if not pipeline_info:
+            continue
+
+        period = result.get("metadata", {}).get("period", "?")
+        print(f"\n📊 {period} - Pipeline detaljer:")
+        print(f"   {'Pass':<8} {'Modell':<8} {'Tid':<8} {'Input':<10} {'Output':<10} {'Kostnad':<10}")
+        print(f"   {'-'*54}")
+
+        total_time = 0
+        for p in pipeline_info.get("passes", []):
+            pass_num = p.get("pass", "?")
+            model = p.get("model", "?")
+            elapsed = p.get("elapsed_seconds", 0)
+            input_tok = p.get("input_tokens", 0)
+            output_tok = p.get("output_tokens", 0)
+            cost = p.get("cost_sek", 0)
+            total_time += elapsed
+
+            print(f"   Pass {pass_num:<3} {model:<8} {elapsed:>5.1f}s   {input_tok:>8,}   {output_tok:>8,}   {cost:>7.4f} kr")
+
+        total_cost = pipeline_info.get("total_cost_sek", 0)
+        print(f"   {'-'*54}")
+        print(f"   {'Totalt':<17} {total_time:>5.1f}s   {'':>8}   {'':>8}   {total_cost:>7.2f} kr")
 
 
 def format_time(seconds: float) -> str:
@@ -363,21 +397,19 @@ def run_interactive_mode(pdf_path: str | None = None):
         print("\nExtraktionstyp:")
         print("   1) Standard (endast finansiella rapporter)")
         print("   2) Full (ALL text och alla tabeller)")
+        print("   3) Multi-pass (Haiku + Sonnet + Haiku)")
         extraction_choice = input("> ").strip()
         full_extraction = extraction_choice == "2"
+        use_multi_pass = extraction_choice == "3"
 
-        # Grafer (endast om full extraktion)
-        skip_charts = False
-        if full_extraction:
-            charts_input = input("\nExtrahera grafer/diagram? [Y/n]: ").strip().upper()
-            skip_charts = charts_input == "N"
-
-        # Modell
-        print("\nModell:")
-        print("   1) Sonnet (rekommenderas)")
-        print("   2) Haiku (billigare, mindre kapabel)")
-        model_choice = input("> ").strip()
-        model = "haiku" if model_choice == "2" else "sonnet"
+        # Modell (endast om inte multi-pass)
+        model = "sonnet"
+        if not use_multi_pass:
+            print("\nModell:")
+            print("   1) Sonnet (rekommenderas)")
+            print("   2) Haiku (billigare, mindre kapabel)")
+            model_choice = input("> ").strip()
+            model = "haiku" if model_choice == "2" else "sonnet"
 
         # === KONTROLLERA CACHE ===
         pdf_hash = get_pdf_hash(str(path))
@@ -410,27 +442,45 @@ def run_interactive_mode(pdf_path: str | None = None):
 
             on_progress, state = create_progress_tracker([str(path)])
 
-            successful, failed = asyncio.run(
-                extract_all_pdfs(
-                    [str(path)],
-                    company_name,
-                    on_progress,
-                    use_cache=False,
-                    full_extraction=full_extraction,
-                    skip_charts=skip_charts,
-                    use_streaming=use_streaming,
-                    model=model
+            if use_multi_pass:
+                print("🔄 Multi-pass pipeline...")
+                from pipeline import extract_all_pdfs_multi_pass
+                successful, failed = asyncio.run(
+                    extract_all_pdfs_multi_pass(
+                        [str(path)],
+                        company_name,
+                        on_progress,
+                        use_cache=False,
+                    )
                 )
-            )
+            else:
+                successful, failed = asyncio.run(
+                    extract_all_pdfs(
+                        [str(path)],
+                        company_name,
+                        on_progress,
+                        use_cache=False,
+                        full_extraction=full_extraction,
+                        use_streaming=use_streaming,
+                        model=model
+                    )
+                )
             print()
 
             if successful:
-                extraction_cost = calculate_cost(state["total_input_tokens"], state["total_output_tokens"])
                 extracted_period = successful[0].get("metadata", {}).get("period", "?")
                 print(f"\n✅ Extraktion klar! Data sparad till databasen.")
                 print(f"   Bolag:  {company_name}")
                 print(f"   Period: {extracted_period}")
-                print(f"   Kostnad: {extraction_cost:.2f} kr")
+
+                # Visa pipeline-detaljer för multi-pass
+                if use_multi_pass:
+                    print_pipeline_details(successful)
+                    # Hämta kostnad från pipeline_info
+                    extraction_cost = successful[0].get("_pipeline_info", {}).get("total_cost_sek", 0)
+                else:
+                    extraction_cost = calculate_cost(state["total_input_tokens"], state["total_output_tokens"])
+                    print(f"   Kostnad: {extraction_cost:.2f} kr")
             else:
                 print("\n❌ Extraktion misslyckades")
                 for path_str, error in failed:
@@ -579,11 +629,6 @@ Exempel:
         help="Använd streaming API (långsammare men visar progress)"
     )
     parser.add_argument(
-        "--skip-charts",
-        action="store_true",
-        help="Hoppa över extraktion av grafer/diagram"
-    )
-    parser.add_argument(
         "--model",
         choices=["sonnet", "haiku"],
         default="sonnet",
@@ -593,6 +638,11 @@ Exempel:
         "--interactive", "-i",
         action="store_true",
         help="Interaktivt läge - guidat flöde för att skapa databöcker"
+    )
+    parser.add_argument(
+        "--multi-pass",
+        action="store_true",
+        help="Använd multi-pass pipeline (Haiku + Sonnet + Haiku)"
     )
 
     args = parser.parse_args()
@@ -701,24 +751,39 @@ Exempel:
 
         # Extrahera nya PDFs
         on_progress, state = create_progress_tracker(add_paths)
-        new_results, failed = asyncio.run(
-            extract_all_pdfs(
-                add_paths,
-                args.company,
-                on_progress,
-                use_cache=not args.no_cache,
-                full_extraction=args.full,
-                skip_charts=args.skip_charts,
-                use_streaming=args.streaming,
-                model=args.model
+        if args.multi_pass:
+            print("🔄 Multi-pass pipeline aktiverad")
+            from pipeline import extract_all_pdfs_multi_pass
+            new_results, failed = asyncio.run(
+                extract_all_pdfs_multi_pass(
+                    add_paths,
+                    args.company,
+                    on_progress,
+                    use_cache=not args.no_cache,
+                )
             )
-        )
+        else:
+            new_results, failed = asyncio.run(
+                extract_all_pdfs(
+                    add_paths,
+                    args.company,
+                    on_progress,
+                    use_cache=not args.no_cache,
+                    full_extraction=args.full,
+                    use_streaming=args.streaming,
+                    model=args.model
+                )
+            )
         print()  # Ny rad efter progress
 
         if failed:
             print(f"\n⚠️  {len(failed)} fil(er) misslyckades:")
             for path, error in failed:
                 print(f"   • {Path(path).name}: {error}")
+
+        # Visa pipeline-detaljer för multi-pass
+        if args.multi_pass and new_results:
+            print_pipeline_details(new_results)
 
         # Kombinera och bygg Excel
         all_data = existing + new_results
@@ -772,24 +837,33 @@ Exempel:
     on_progress, state = create_progress_tracker(pdf_path_strs)
 
     # Kör extraktion
-    if args.full:
-        print("🔍 Full extraktion aktiverad - extraherar ALL text och alla tabeller")
-    if args.skip_charts:
-        print("📊 Hoppar över grafer/diagram")
-    if args.model == "haiku":
-        print("🤖 Använder Haiku-modellen (billigare men mindre kapabel)")
-    successful, failed = asyncio.run(
-        extract_all_pdfs(
-            pdf_path_strs,
-            args.company,
-            on_progress,
-            use_cache=not args.no_cache,
-            full_extraction=args.full,
-            skip_charts=args.skip_charts,
-            use_streaming=args.streaming,
-            model=args.model
+    if args.multi_pass:
+        print("🔄 Multi-pass pipeline aktiverad (Haiku → Sonnet → Haiku)")
+        from pipeline import extract_all_pdfs_multi_pass
+        successful, failed = asyncio.run(
+            extract_all_pdfs_multi_pass(
+                pdf_path_strs,
+                args.company,
+                on_progress,
+                use_cache=not args.no_cache,
+            )
         )
-    )
+    else:
+        if args.full:
+            print("🔍 Full extraktion aktiverad - extraherar ALL text och alla tabeller")
+        if args.model == "haiku":
+            print("🤖 Använder Haiku-modellen (billigare men mindre kapabel)")
+        successful, failed = asyncio.run(
+            extract_all_pdfs(
+                pdf_path_strs,
+                args.company,
+                on_progress,
+                use_cache=not args.no_cache,
+                full_extraction=args.full,
+                use_streaming=args.streaming,
+                model=args.model
+            )
+        )
     print("\n")  # Ny rad efter progress bar
 
     # Sammanfattning
@@ -803,9 +877,13 @@ Exempel:
         for path, error in failed:
             print(f"   • {Path(path).name}: {error}")
 
-    # Kostnadssammanfattning
+    # Visa pipeline-detaljer för multi-pass
+    if args.multi_pass and successful:
+        print_pipeline_details(successful)
+
+    # Kostnadssammanfattning (om inte multi-pass, som redan visar detta)
     total_tokens = state["total_input_tokens"] + state["total_output_tokens"]
-    if total_tokens > 0:
+    if total_tokens > 0 and not args.multi_pass:
         total_cost = calculate_cost(state["total_input_tokens"], state["total_output_tokens"])
         print(f"\n💰 Kostnad:")
         print(f"   Input:  {state['total_input_tokens']:,} tokens")

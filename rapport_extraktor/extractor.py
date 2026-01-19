@@ -13,7 +13,7 @@ from typing import Callable
 
 from anthropic import AsyncAnthropic
 
-from prompts import EXTRACTION_PROMPT, FULL_EXTRACTION_PROMPT, FULL_EXTRACTION_PROMPT_NO_CHARTS
+from prompts import EXTRACTION_PROMPT, FULL_EXTRACTION_PROMPT
 from supabase_client import (
     get_or_create_company,
     period_exists,
@@ -199,7 +199,6 @@ async def extract_pdf(
     progress_callback: Callable[[str, str, dict | None], None] | None = None,
     use_cache: bool = True,
     full_extraction: bool = False,
-    skip_charts: bool = False,
     use_streaming: bool = False,
     model: str = "sonnet"
 ) -> dict:
@@ -214,7 +213,6 @@ async def extract_pdf(
         progress_callback: Callback för progress (pdf_path, status, token_info)
         use_cache: Om True, använd cachad data om tillgänglig
         full_extraction: Om True, extrahera ALL data (sections + tables)
-        skip_charts: Om True, extrahera inte grafer/diagram
         use_streaming: Om True, använd streaming API (långsammare)
         model: Vilken modell att använda ("sonnet" eller "haiku")
 
@@ -260,9 +258,9 @@ async def extract_pdf(
         last_error = None
         for attempt in range(MAX_RETRIES):
             try:
-                # Välj prompt baserat på extraktionstyp och skip_charts
+                # Välj prompt baserat på extraktionstyp
                 if full_extraction:
-                    prompt = FULL_EXTRACTION_PROMPT_NO_CHARTS if skip_charts else FULL_EXTRACTION_PROMPT
+                    prompt = FULL_EXTRACTION_PROMPT
                 else:
                     prompt = EXTRACTION_PROMPT
                 max_tokens = 24000 if full_extraction else 8192
@@ -397,7 +395,6 @@ async def extract_all_pdfs(
     on_progress: Callable[[str, str], None] | None = None,
     use_cache: bool = True,
     full_extraction: bool = False,
-    skip_charts: bool = False,
     use_streaming: bool = False,
     model: str = "sonnet"
 ) -> tuple[list[dict], list[tuple[str, Exception]]]:
@@ -410,7 +407,6 @@ async def extract_all_pdfs(
         on_progress: Callback för progress-uppdateringar
         use_cache: Om True, använd cachad data
         full_extraction: Om True, extrahera ALL data (sections + tables)
-        skip_charts: Om True, extrahera inte grafer/diagram
         use_streaming: Om True, använd streaming API
         model: Vilken modell att använda ("sonnet" eller "haiku")
 
@@ -437,7 +433,7 @@ async def extract_all_pdfs(
             return await extract_pdf(
                 path, client, semaphore, company_id,
                 on_progress, use_cache, full_extraction,
-                skip_charts, use_streaming, model
+                use_streaming, model
             )
         except Exception as e:
             return (path, e)

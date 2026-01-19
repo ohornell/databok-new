@@ -10,91 +10,90 @@ import json
 import os
 import re
 
-from anthropic import Anthropic
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-from prompts import NORMALIZE_PROMPT
-
-
 def normalize_row_name(name: str) -> str:
-    """
-    Normalisera radnamn för jämförelse mellan kvartal.
-    Enkel fallback om AI-normalisering inte används.
-    """
+    """Normalisera radnamn för matchning mellan perioder."""
     if not name:
         return ""
-    return name.lower().strip()
+    # Lowercase, ta bort extra whitespace
+    normalized = name.lower().strip()
+    # Ta bort vanliga variationer
+    normalized = normalized.replace("  ", " ")
+    # Ta bort parenteser med innehåll (t.ex. "(MSEK)")
+    normalized = re.sub(r'\s*\([^)]*\)', '', normalized)
+    return normalized
 
 
-def ai_normalize_rows(data_list: list[dict]) -> tuple[list[dict], dict | None]:
+def map_table_type(table: dict) -> str:
     """
-    Använd AI för att normalisera alla radnamn till konsekventa svenska termer.
-    Detta körs en gång på all data innan Excel byggs.
+    Mappa tabelltyp, inklusive quarterly → rätt typ baserat på titel.
+
+    Quarterly-tabeller (som "Koncernens resultaträkningar per kvartal")
+    mappas till sin underliggande typ (income_statement, kpi, etc.)
+    """
+    table_type = table.get("type", "other")
+    if table_type == "quarterly":
+        title = table.get("title", "").lower()
+        if "resultat" in title or "income" in title:
+            return "income_statement"
+        elif "balans" in title or "ställning" in title or "balance" in title:
+            return "balance_sheet"
+        elif "kassaflöde" in title or "cash" in title:
+            return "cash_flow"
+        elif "nyckeltal" in title or "kpi" in title:
+            return "kpi"
+        elif "segment" in title:
+            return "segment"
+        else:
+            return "other"
+    return table_type
+
+
+def extract_year_from_column(col_name: str) -> int:
+    """
+    Extrahera årtal från kolumnnamn för sortering.
+
+    Exempel:
+        "Juli-september 2025" -> 2025
+        "Januari-mars 2024" -> 2024
+        "Helår 2024" -> 2024
+        "Q3 2025" -> 2025
 
     Returns:
-        Tuple av (normaliserad data, token_info eller None)
+        Årtal som int, eller 0 om inget hittades
     """
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        print("⚠️  Ingen ANTHROPIC_API_KEY - hoppar över AI-normalisering")
-        return data_list, None
+    if not col_name:
+        return 0
+    # Sök efter 4-siffrigt årtal (2020-2030)
+    match = re.search(r'20[2-3]\d', str(col_name))
+    return int(match.group()) if match else 0
 
-    # Samla alla unika radnamn från alla rapporter
-    all_row_names = set()
+
+def determine_current_year(data_list: list[dict]) -> int:
+    """
+    Bestäm dynamiskt vilket år som är "current" baserat på datan.
+
+    Returnerar det SENASTE året som förekommer i perioderna.
+    """
+    years = set()
     for item in data_list:
-        for key in ["resultatrakning", "balansrakning", "kassaflodesanalys"]:
-            for row in item.get(key, []):
-                name = row.get("rad") or row.get("namn", "")
-                if name:
-                    all_row_names.add(name)
+        period = item.get("metadata", {}).get("period", "")
+        year = extract_year_from_column(period)
+        if year:
+            years.add(year)
 
-    if not all_row_names:
-        return data_list, None
+        # Kolla även kolumnrubriker
+        for table in item.get("tables", []):
+            for col in table.get("columns", []):
+                year = extract_year_from_column(col)
+                if year:
+                    years.add(year)
 
-    # Anropa Claude för att skapa mappning
-    print("🔄 Normaliserar radnamn med AI...")
-    client = Anthropic(api_key=api_key)
+    return max(years) if years else 2025  # Fallback till 2025 om inget hittas
 
-    try:
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=4096,
-            messages=[{
-                "role": "user",
-                "content": NORMALIZE_PROMPT.format(row_names=json.dumps(list(all_row_names), ensure_ascii=False, indent=2))
-            }]
-        )
-
-        # Token-info
-        token_info = {
-            "input_tokens": response.usage.input_tokens,
-            "output_tokens": response.usage.output_tokens,
-        }
-
-        # Parsa mappningen
-        text = response.content[0].text.strip()
-        if text.startswith("```"):
-            lines = text.split("\n")
-            text = "\n".join(lines[1:-1] if lines[-1] == "```" else lines[1:])
-
-        mapping = json.loads(text)
-
-        # Applicera mappningen på all data
-        for item in data_list:
-            for key in ["resultatrakning", "balansrakning", "kassaflodesanalys"]:
-                for row in item.get(key, []):
-                    old_name = row.get("rad") or row.get("namn", "")
-                    if old_name and old_name in mapping:
-                        row["rad"] = mapping[old_name]
-
-        print(f"✅ Normaliserade {len(mapping)} radnamn")
-        return data_list, token_info
-
-    except Exception as e:
-        print(f"⚠️  AI-normalisering misslyckades: {e}")
-        return data_list, None
 
 # ============================================
 # INVESTMENT BANK STYLE GUIDE
@@ -112,6 +111,7 @@ COLOR_HARDCODED = "0000FF"  # Blå - hårdkodade värden
 
 # Fonter
 TITLE_FONT = Font(name='Arial', size=11, bold=True, color=GS_NAVY)
+TABLE_TITLE_FONT = Font(name='Arial', size=11, bold=True, color=GS_NAVY)  # Tabellrubriker
 SUBTITLE_FONT = Font(name='Arial', size=10, color=GS_DARK_GRAY)
 HEADER_FONT = Font(name='Arial', size=9, bold=True, color="FFFFFF")
 SUBHEADER_FONT = Font(name='Arial', size=8, italic=True, color=GS_DARK_GRAY)
@@ -503,11 +503,12 @@ def populate_dynamic_table_sheet(
     Varje tabell visas separat med alla sina kolumner.
     """
     # Hitta alla tabeller av denna typ från alla perioder
+    # Använd map_table_type för att inkludera quarterly-tabeller
     all_tables = []
     for item in data_list:
         period = item.get("metadata", {}).get("period", "?")
         for table in item.get("tables", []):
-            if table.get("type") == table_type:
+            if map_table_type(table) == table_type:
                 all_tables.append({
                     "period": period,
                     "table": table
@@ -548,10 +549,15 @@ def populate_dynamic_table_sheet(
             current_row = write_period_separator(ws, current_row, period, num_cols=8, is_multi_period=is_multi_period)
             current_period = period
 
-        # Tabellens titel
+        # Tabellens titel med sidnummer
         title = table.get("title", type_titles.get(table_type, "Tabell"))
-        ws.cell(row=current_row, column=1, value=title)
-        ws.cell(row=current_row, column=1).font = SUBTITLE_FONT
+        page = table.get("page")
+        if page:
+            title_with_page = f"{title} (s. {page})"
+        else:
+            title_with_page = title
+        ws.cell(row=current_row, column=1, value=title_with_page)
+        ws.cell(row=current_row, column=1).font = TABLE_TITLE_FONT
         current_row += 1
 
         # Kolumnrubriker från tabellen
@@ -559,6 +565,12 @@ def populate_dynamic_table_sheet(
         # Första kolumnen är tom (för radnamn), resten är värdekolumner
         # Hoppa över första kolumnen om den är tom/bara beskrivning
         value_columns = columns[1:] if columns and columns[0] in ["", "MSEK", "TSEK", "SEK"] else columns
+
+        # Filtrera bort "Not"/"Note"-kolumner (inte numeriska värden)
+        # not_col_indices är relativt till value_columns (som börjar efter label-kolumnen)
+        not_col_indices = set(i for i, c in enumerate(value_columns) if str(c).lower() in ["not", "note", "notes"])
+        if not_col_indices:
+            value_columns = [c for i, c in enumerate(value_columns) if i not in not_col_indices]
 
         # Header-rad
         ws.cell(row=current_row, column=1, value="").font = HEADER_FONT
@@ -586,8 +598,11 @@ def populate_dynamic_table_sheet(
             # Radnamn
             ws.cell(row=current_row, column=1, value=label)
 
-            # Värden
-            for val_idx, value in enumerate(values):
+            # Värden - hoppa över Not-kolumnens index
+            # values[0] är alltid null (label), values[1:] motsvarar value_columns innan filtrering
+            # Vi måste filtrera values[1:] med samma not_col_indices
+            filtered_values = [v for i, v in enumerate(values[1:]) if i not in not_col_indices] if not_col_indices else values[1:]
+            for val_idx, value in enumerate(filtered_values):
                 if val_idx + 2 <= num_cols:
                     ws.cell(row=current_row, column=val_idx + 2, value=value)
 
@@ -614,6 +629,36 @@ def populate_sections_sheet(ws, data_list: list[dict], section_title: str, compa
     Fyll ett blad med textsektioner från full extraktion.
     Visar samma sektion från alla kvartal.
     """
+    # Fonter
+    TEXT_FONT = Font(name='Arial', size=10, color=GS_DARK_GRAY)
+    BULLET_FONT = Font(name='Arial', size=10, color=GS_DARK_GRAY)
+    SUBHEADER_FONT = Font(name='Arial', size=10, bold=True, color=GS_DARK_GRAY)
+
+    def is_subheader(line: str) -> bool:
+        """Kolla om en rad är en underrubrik (kort, utan bullet, ej siffra)."""
+        if len(line) > 50:  # För lång för att vara rubrik
+            return False
+        if line.startswith(('• ', '- ', '* ', '– ')):  # Bullet
+            return False
+        if len(line) > 2 and line[0].isdigit() and line[1] in '.):':  # Numrerad
+            return False
+        # Kort text som ser ut som rubrik
+        words = line.split()
+        if len(words) <= 6 and not line.endswith(('.', ',')):
+            return True
+        return False
+
+    def content_similarity(c1: str, c2: str) -> float:
+        """Beräkna likhet mellan två texter (0-1)."""
+        # Ta första 200 tecken för snabb jämförelse
+        s1 = c1[:200].lower().replace(' ', '')
+        s2 = c2[:200].lower().replace(' ', '')
+        if not s1 or not s2:
+            return 0
+        # Enkel Jaccard-liknande metric
+        common = sum(1 for c in s1 if c in s2)
+        return common / max(len(s1), len(s2))
+
     # Hitta alla sektioner med denna titel
     all_sections = []
     for item in data_list:
@@ -628,21 +673,31 @@ def populate_sections_sheet(ws, data_list: list[dict], section_title: str, compa
     if not all_sections:
         return
 
-    # Titel
+    # Deduplicera sektioner med liknande innehåll (>80% likhet)
+    unique_sections = []
+    for section_info in all_sections:
+        content = section_info["section"].get("content", "")
+        is_duplicate = False
+        for existing in unique_sections:
+            existing_content = existing["section"].get("content", "")
+            if content_similarity(content, existing_content) > 0.8:
+                is_duplicate = True
+                break
+        if not is_duplicate:
+            unique_sections.append(section_info)
+
+    # Bolagsnamn som huvudrubrik (samma som tabeller)
     ws['A1'] = company_name.upper()
     ws['A1'].font = TITLE_FONT
     ws['A1'].alignment = LEFT_ALIGN
 
-    ws['A2'] = section_title
-    ws['A2'].font = SUBTITLE_FONT
-
-    current_row = 4
+    current_row = 3
 
     # Kolla om det är multi-period (för periodavdelare)
     is_multi_period = len(data_list) > 1
     current_period = None
 
-    for section_info in all_sections:
+    for section_info in unique_sections:
         period = section_info["period"]
         section = section_info["section"]
 
@@ -651,34 +706,88 @@ def populate_sections_sheet(ws, data_list: list[dict], section_title: str, compa
             current_row = write_period_separator(ws, current_row, period, num_cols=1, is_multi_period=is_multi_period)
             current_period = period
 
-        # Sidnummer
+        # Sektionens titel med sidnummer (samma format som tabeller)
         page = section.get("page")
         if page:
-            ws.cell(row=current_row, column=1, value=f"Sida {page}")
-            ws.cell(row=current_row, column=1).font = SOURCE_FONT
-            current_row += 1
+            title_with_page = f"{section_title} (s. {page})"
+        else:
+            title_with_page = section_title
+        ws.cell(row=current_row, column=1, value=title_with_page)
+        ws.cell(row=current_row, column=1).font = TABLE_TITLE_FONT
+        current_row += 1
 
-        # Textinnehåll - dela upp i rader om för långt
+        # Textinnehåll - behåll styckeindelning och punktlistor
         content = section.get("content", "")
-        # Dela upp text i rader med max 100 tecken
-        words = content.split()
-        lines = []
-        current_line = ""
-        for word in words:
-            if len(current_line) + len(word) + 1 <= 100:
-                current_line = current_line + " " + word if current_line else word
-            else:
-                if current_line:
-                    lines.append(current_line)
-                current_line = word
-        if current_line:
-            lines.append(current_line)
 
-        for line in lines:
-            ws.cell(row=current_row, column=1, value=line)
+        # Dela upp på stycken (dubbla radbrytningar)
+        paragraphs = content.split('\n\n')
+
+        for para in paragraphs:
+            para = para.strip()
+            if not para:
+                continue
+
+            lines = para.split('\n')
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+
+                # Identifiera radtyp
+                is_bullet = False
+                is_sub = False
+
+                if line.startswith(('• ', '- ', '* ', '– ')):
+                    is_bullet = True
+                elif len(line) > 2 and line[0].isdigit() and line[1] in '.):':
+                    is_bullet = True
+                elif is_subheader(line):
+                    is_sub = True
+
+                # Välj font
+                if is_sub:
+                    font = SUBHEADER_FONT
+                elif is_bullet:
+                    font = BULLET_FONT
+                else:
+                    font = TEXT_FONT
+
+                # Radbryt långa rader (max 120 tecken)
+                if len(line) > 120:
+                    words = line.split()
+                    wrapped_lines = []
+                    current_line = ""
+                    indent = "   " if is_bullet else ""
+
+                    for word in words:
+                        test_line = current_line + " " + word if current_line else word
+                        if len(test_line) <= 120:
+                            current_line = test_line
+                        else:
+                            if current_line:
+                                wrapped_lines.append(current_line)
+                            current_line = indent + word if wrapped_lines else word
+                    if current_line:
+                        wrapped_lines.append(current_line)
+
+                    for wline in wrapped_lines:
+                        cell = ws.cell(row=current_row, column=1, value=wline)
+                        cell.font = font
+                        cell.alignment = Alignment(wrap_text=False, vertical='top')
+                        current_row += 1
+                else:
+                    cell = ws.cell(row=current_row, column=1, value=line)
+                    cell.font = font
+                    cell.alignment = Alignment(wrap_text=False, vertical='top')
+                    current_row += 1
+
+            # Tom rad mellan stycken
             current_row += 1
 
-        current_row += 2  # Mellanrum mellan perioder
+        current_row += 1  # Extra mellanrum efter sektion
+
+    # Källa (samma som tabeller)
+    ws.cell(row=current_row, column=1, value=f"Källa: {company_name} kvartalsrapporter").font = SOURCE_FONT
 
     # Kolumnbredd
     ws.column_dimensions['A'].width = 120
@@ -1006,13 +1115,8 @@ def build_databook(extracted_data: list[dict], output_path: str) -> dict | None:
     # Hämta bolagsnamn
     company_name = sorted_data[0].get("metadata", {}).get("bolag", "Okänt bolag")
 
-    normalize_tokens = None
-
     if has_legacy and not has_tables:
-        # Legacy-format - använd AI-normalisering
-        normalized_data, normalize_tokens = ai_normalize_rows(extracted_data)
-        sorted_data = sort_by_period(normalized_data)
-
+        # Legacy-format
         # Separator för siffror
         create_separator_sheet(wb, "═ SIFFROR ═")
 
@@ -1034,10 +1138,11 @@ def build_databook(extracted_data: list[dict], output_path: str) -> dict | None:
         create_separator_sheet(wb, "═ SIFFROR & GRAFER ═")
 
         # Nytt format - skapa flikar för varje tabelltyp som finns
+        # (map_table_type hanterar quarterly → rätt typ baserat på titel)
         table_types_found = set()
         for item in sorted_data:
             for table in item.get("tables", []):
-                table_types_found.add(table.get("type", "other"))
+                table_types_found.add(map_table_type(table))
 
         # Ordning för flikar
         type_order = ["income_statement", "balance_sheet", "cash_flow", "kpi", "segment", "other"]
@@ -1063,16 +1168,75 @@ def build_databook(extracted_data: list[dict], output_path: str) -> dict | None:
             populate_charts_sheet(ws, sorted_data, company_name)
 
         # === SEKTION 2: TEXT ===
-        # Samla alla sektioner med sidnummer för sortering
+        # Samla alla unika sektioner (deduplicera baserat på innehåll)
+        def get_bullet_fingerprint(text: str) -> set:
+            """Extrahera fingerprint baserat på bullet points (mer distinkt)."""
+            # Hitta alla rader som börjar med bullet
+            bullets = set()
+            for line in text.split('\n'):
+                line = line.strip()
+                if line.startswith(('• ', '- ', '* ', '– ')):
+                    # Ta första 50 tecken efter bullet som fingerprint
+                    bullet_text = line[2:52].lower().strip()
+                    if bullet_text:
+                        bullets.add(bullet_text)
+            return bullets
+
+        def is_content_duplicate(c1: str, c2: str) -> bool:
+            """Kolla om två sektioner är dubbletter."""
+            # Metod 1: Jämför bullet points (bäst för rapporter)
+            b1 = get_bullet_fingerprint(c1)
+            b2 = get_bullet_fingerprint(c2)
+            if b1 and b2:
+                # Om minst 3 bullets matchar, är det troligen samma innehåll
+                common = b1 & b2
+                if len(common) >= 3:
+                    return True
+                # Om >70% av bullets matchar
+                min_bullets = min(len(b1), len(b2))
+                if min_bullets > 0 and len(common) / min_bullets > 0.7:
+                    return True
+
+            # Metod 2: Exakt matchning av första meningen efter whitespace-normalisering
+            def first_sentence(t: str) -> str:
+                # Skippa rubriker (korta rader utan punkt)
+                for line in t.split('\n'):
+                    line = line.strip()
+                    if len(line) > 50 and ('.' in line or '•' in line):
+                        return line[:100].lower().replace(' ', '')
+                return ""
+
+            s1 = first_sentence(c1)
+            s2 = first_sentence(c2)
+            if s1 and s2 and s1 == s2:
+                return True
+
+            return False
+
         sections_with_page = []
         seen_titles = set()
+        seen_contents = []  # Lista med innehåll för likhetsjämförelse
+
         for item in sorted_data:
             for section in item.get("sections", []):
                 title = section.get("title", "")
+                content = section.get("content", "")
+
+                # Skippa om vi redan har en sektion med samma innehåll
+                is_duplicate = False
+                for existing_content in seen_contents:
+                    if is_content_duplicate(content, existing_content):
+                        is_duplicate = True
+                        break
+
+                if is_duplicate:
+                    continue
+
                 if title and title not in seen_titles:
-                    page = section.get("page", 999)  # Default högt om sida saknas
+                    page = section.get("page", 999)
                     sections_with_page.append((page, title))
                     seen_titles.add(title)
+                    seen_contents.append(content)
 
         # Sortera efter sidnummer (kronologisk ordning)
         sections_with_page.sort(key=lambda x: x[0])
@@ -1092,4 +1256,4 @@ def build_databook(extracted_data: list[dict], output_path: str) -> dict | None:
     # Spara
     wb.save(output_path)
 
-    return normalize_tokens
+    return None  # Ingen normalisering längre
