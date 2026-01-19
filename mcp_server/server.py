@@ -523,68 +523,6 @@ def db_compare_periods(company_slug: str, period1: str, period2: str) -> dict:
     }
 
 
-def format_chart_data(data_points: list, chart_type: str = "bar") -> dict:
-    """Generera tabell och ASCII-visualisering från datapunkter."""
-    if not data_points:
-        return {"data_table": "", "data_visual": ""}
-
-    # Extrahera labels och värden
-    try:
-        # Hantera olika format av data_points
-        if isinstance(data_points[0], dict):
-            labels = [str(dp.get("label", dp.get("x", dp.get("name", f"#{i}"))))
-                      for i, dp in enumerate(data_points)]
-            values = [float(dp.get("value", dp.get("y", 0))) for dp in data_points]
-        elif isinstance(data_points[0], (list, tuple)):
-            labels = [str(dp[0]) for dp in data_points]
-            values = [float(dp[1]) if len(dp) > 1 else 0 for dp in data_points]
-        else:
-            return {"data_table": "", "data_visual": ""}
-    except (ValueError, TypeError, IndexError):
-        return {"data_table": "", "data_visual": ""}
-
-    if not values:
-        return {"data_table": "", "data_visual": ""}
-
-    # Bygg markdown-tabell
-    max_label_len = max(len(l) for l in labels) if labels else 6
-    table_lines = [
-        f"| {'Period':<{max_label_len}} | Värde |",
-        f"|{'-' * (max_label_len + 2)}|-------|"
-    ]
-    for label, value in zip(labels, values):
-        table_lines.append(f"| {label:<{max_label_len}} | {value:,.0f} |")
-    data_table = "\n".join(table_lines)
-
-    # Bygg ASCII-graf
-    max_value = max(abs(v) for v in values) if values else 1
-    bar_width = 30
-    visual_lines = []
-
-    for i, (label, value) in enumerate(zip(labels, values)):
-        # Beräkna stapelbredd
-        bar_len = int((abs(value) / max_value) * bar_width) if max_value > 0 else 0
-        bar = "█" * bar_len
-
-        # Beräkna förändring från föregående
-        if i > 0 and values[i-1] != 0:
-            change = ((value - values[i-1]) / abs(values[i-1])) * 100
-            change_str = f" ({change:+.0f}%)" if abs(change) > 0.5 else ""
-        else:
-            change_str = ""
-
-        # Formatera värde
-        value_str = f"{value:,.0f}"
-        visual_lines.append(f"{label:<8} |{bar} {value_str}{change_str}")
-
-    data_visual = "\n".join(visual_lines)
-
-    return {
-        "data_table": data_table,
-        "data_visual": data_visual
-    }
-
-
 def db_get_charts(company_slug: str, period: str | None = None) -> dict:
     """Hämta grafer/diagram för en period."""
     client = get_client()
