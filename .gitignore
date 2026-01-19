@@ -6,6 +6,7 @@ __pycache__/
 venv/
 .venv/
 *.egg-info/
+.pytest_cache/
 
 # Cache
 .cache/
@@ -35,3 +36,6 @@ venv/
 # PDF reports (lägg till egna rapporter lokalt)
 reports/
 *_reports/
+
+# Test directories
+test_*/

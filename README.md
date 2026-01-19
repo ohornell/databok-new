@@ -15,19 +15,31 @@ Extraherar finansiell data från PDF-kvartalsrapporter och skapar professionella
 
 ### Grundläggande
 - Automatisk extraktion av finansiell data från PDF-rapporter via Claude API
-- Stöd för resultaträkning, balansräkning och kassaflödesanalys
-- Professionellt formaterad Excel-output (Goldman Sachs-inspirerad stil)
+- Stöd för resultaträkning, balansräkning, kassaflödesanalys och alla tabeller
+- Professionellt formaterad Excel-output (Investment Bank-stil)
 - Supabase-lagring för snabb sökning och frontend-koppling
 - Parallell bearbetning av flera PDF-filer (upp till 5 samtidiga)
 - Smart caching - redan extraherade rapporter hämtas från databasen
 - Token-tracking i realtid med kostnadssammanfattning efter körning
 - Smart AI-driven radnormalisering för att matcha liknande radnamn mellan kvartal
 
-### Full extraktion (`--full`)
-- Extraherar ALL text från rapporten (VD-ord, marknadsöversikt, verksamhetsbeskrivning etc.)
-- Extraherar ALLA tabeller (koncern, moderbolag, nyckeltal, segment)
-- Extraherar grafer/diagram med datapunkter (stapel, linje, cirkel, yta)
-- Separata Excel-flikar för textsektioner och grafer
+### Multi-pass Pipeline (`--multi-pass`) ⭐ Rekommenderad
+Optimerad extraktion med tre pass för bästa resultat:
+
+```
+Pass 1 (Haiku)  → Strukturidentifiering (~1-2s)
+Pass 2 (Sonnet) → Tabellextraktion med hög precision (~3-5s)  ┐
+Pass 3 (Haiku)  → Textextraktion (~1-2s)                      ┘ Körs parallellt!
+```
+
+- Pass 2 & 3 körs parallellt för snabbare extraktion
+- Haiku för enklare uppgifter (billigare), Sonnet för tabeller (högre precision)
+- Detaljerad timing och kostnad per pass visas efter körning
+
+### Interaktivt läge (`-i`)
+- Guidat flöde för att välja bolag och perioder
+- Skapa databöcker för enskilda kvartal eller alla perioder
+- Extrahera nya rapporter och spara direkt till databasen
 
 ## Installation
 
@@ -40,23 +52,24 @@ pip install -r requirements.txt
 
 ### Anthropic API
 
-Exportera din API-nyckel:
+Skapa `.env` från mallen:
 ```bash
-export ANTHROPIC_API_KEY='din-nyckel'
+cp .env.example .env
+```
+
+Lägg in din API-nyckel i `.env`:
+```
+ANTHROPIC_API_KEY=din-nyckel-här
 ```
 
 ### Supabase Setup
 
 1. Skapa ett projekt på [supabase.com](https://supabase.com)
-2. Kopiera `.env.example` till `.env`:
-   ```bash
-   cp .env.example .env
-   ```
-3. Fyll i credentials från **Project Settings > API**:
+2. Fyll i credentials i `.env` från **Project Settings > API**:
    - `SUPABASE_URL` - Project URL
    - `SUPABASE_KEY` - anon/public key
 
-4. Verifiera setup (ger instruktioner om tabeller saknas):
+3. Verifiera setup:
    ```bash
    python main.py --check-db
    ```
@@ -64,161 +77,149 @@ export ANTHROPIC_API_KEY='din-nyckel'
 
 ## Användning
 
-### Extrahera rapporter för ett bolag
+### Interaktivt läge (rekommenderat)
 
 ```bash
-python main.py ./rapporter/ --company "Freemelt" -o databok.xlsx
+python main.py -i
+```
+
+Guidat flöde:
+1. Välj bolag från listan eller skapa nytt
+2. Välj åtgärd: Skapa databok eller extrahera nytt kvartal
+3. Välj extraktionstyp (Standard/Full/Multi-pass)
+4. Skapa databok från extraherad data
+
+### Multi-pass extraktion (rekommenderat)
+
+```bash
+python main.py ./rapporter/ --company "Bolagsnamn" -o databok.xlsx --multi-pass
+```
+
+Output med detaljerad timing:
+```
+📄 Hittade 1 PDF-fil(er) i ./rapporter/
+🏢 Bolag: Bolagsnamn
+🔄 Multi-pass pipeline aktiverad (Haiku → Sonnet → Haiku)
+
+[X] q3_2025.pdf    185,000 tok | 4.65 kr | 5.4s
+    Totalt: 185,000 tokens | 4.65 kr | 5.4s
+
+══════════════════════════════════════════════════
+✅ Lyckades:  1
+
+📊 Q3 2025 - Pipeline detaljer:
+   Pass     Modell   Tid      Input      Output     Kostnad
+   ------------------------------------------------------
+   Pass 1   haiku     1.2s      85,000      3,500    0.2205 kr
+   Pass 2   sonnet    3.5s      92,000      8,200    4.1790 kr
+   Pass 3   haiku     1.8s      88,000      4,100    0.2464 kr
+   ------------------------------------------------------
+   Totalt             5.2s                           4.65 kr
+
+📊 Databok skapad: databok.xlsx
+   Innehåller 1 period(er)
+```
+
+### Standard extraktion
+
+```bash
+python main.py ./rapporter/ --company "Bolagsnamn" -o databok.xlsx
 ```
 
 ### Full extraktion (text, alla tabeller, grafer)
 
 ```bash
-python main.py ./rapporter/ --company "Freemelt" -o databok.xlsx --full
-```
-
-Output:
-```
-📄 Hittade 4 PDF-fil(er) i ./rapporter/
-🏢 Bolag: Freemelt
-
-[X] freemelt-q1-2025.pdf    31,200 tok | 1.25 kr | 12.3s
-[X] freemelt-q2-2025.pdf    32,450 tok | 1.31 kr | 11.8s
-[X] freemelt-q3-2025.pdf    30,890 tok | 1.22 kr | 13.1s
-[~] freemelt-q4-2025.pdf    8.5s
-    Totalt: 94,540 tokens | 3.78 kr | 45.7s
-
-══════════════════════════════════════════════════
-✅ Lyckades:  4
-
-💰 Kostnad:
-   Input:  122,150 tokens
-   Output: 3,280 tokens
-   Totalt: 5.04 kr
-
-📊 Databok skapad: databok.xlsx
-   Innehåller 4 period(er)
-
-💰 Normaliseringskostnad: 0.15 kr
+python main.py ./rapporter/ --company "Bolagsnamn" -o databok.xlsx --full
 ```
 
 ### Lägg till nya rapporter
 
-Lägg in Q4-rapporten i samma mapp och kör igen. Cachade rapporter (Q1-Q3) hoppas över automatiskt:
-
 ```bash
-python main.py ./rapporter/ --company "Freemelt" -o databok.xlsx
+python main.py --company "Bolagsnamn" --add ny_rapport.pdf -o databok.xlsx --multi-pass
 ```
-
-Output:
-```
-[C] freemelt-q1-2025.pdf    (cachad)
-[C] freemelt-q2-2025.pdf    (cachad)
-[C] freemelt-q3-2025.pdf    (cachad)
-[X] freemelt-q4-2025.pdf    32,020 tok | 1.26 kr | 11.5s
-    Totalt: 32,020 tokens | 1.26 kr | 12.1s
-```
-
-Endast Q4 extraheras (kostar tokens), Q1-Q3 laddas från databasen (gratis).
 
 ### Generera Excel från databas (utan ny extraktion)
 
 ```bash
-python main.py --company "Freemelt" --from-db -o databok.xlsx
+python main.py --company "Bolagsnamn" --from-db -o databok.xlsx
 ```
 
 ### Filtrera på specifika perioder
 
 ```bash
-python main.py --company "Freemelt" --from-db -o databok.xlsx --period "Q1 2025" "Q2 2025"
+python main.py --company "Bolagsnamn" --from-db -o databok.xlsx --period "Q1 2025" "Q2 2025"
 ```
 
-### Lista alla bolag i databasen
+### Lista alla bolag
 
 ```bash
 python main.py --list-companies
 ```
 
-### Ignorera cache och extrahera allt på nytt
+## Kostnader
 
-```bash
-python main.py ./rapporter/ --company "Freemelt" -o databok.xlsx --no-cache
+### Token-priser (USD per 1M tokens)
+
+| Modell | Input | Output |
+|--------|-------|--------|
+| Haiku  | $0.80 | $4.00  |
+| Sonnet | $3.00 | $15.00 |
+
+### Typiska kostnader per rapport
+
+| Läge | Kostnad (SEK) | Beskrivning |
+|------|---------------|-------------|
+| Multi-pass | ~4-6 kr | Haiku + Sonnet + Haiku |
+| Standard | ~1-2 kr | Endast Sonnet |
+| Full | ~4-5 kr | Sonnet med all text |
+
+## Pipeline
+
+### Multi-pass flöde
+
 ```
+┌─────────────────────────────────────────────────────────────┐
+│                    MULTI-PASS PIPELINE                       │
+└─────────────────────────────────────────────────────────────┘
 
-## Flöde
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              EXTRAKTIONSFLÖDE                               │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-  PDF-fil                    Claude API                      Supabase
-  ───────                    ──────────                      ────────
-
-  ┌─────────┐
-  │ Q1.pdf  │──┐
-  └─────────┘  │
-  ┌─────────┐  │   ┌──────────────────────────┐
-  │ Q2.pdf  │──┼──▶│  1. EXTRAKTION           │
-  └─────────┘  │   │  (async, 5 parallella)   │
-  ┌─────────┐  │   │                          │
-  │ Q3.pdf  │──┘   │  • Skicka PDF som base64 │
-  └─────────┘      │  • Claude läser & tolkar │
-               │  • Returnerar JSON        │
-               └────────────┬─────────────┘
-                            │
-                            ▼
-               ┌──────────────────────────┐
-               │  JSON per kvartal:       │
-               │  {                       │
-               │    metadata: {...},      │
-               │    resultatrakning: [...],│
-               │    balansrakning: [...], │
-               │    kassaflodesanalys: [..]│
-               │  }                       │
-               └────────────┬─────────────┘
-                            │
-                            ▼
-               ┌──────────────────────────┐     ┌──────────────────┐
-               │  2. SPARA TILL SUPABASE  │────▶│  companies       │
-               │                          │     │  ├─ id           │
-               │  • get_or_create_company │     │  ├─ name         │
-               │  • save_period           │     │  └─ slug         │
-               │  • Hash PDF för cache    │     ├──────────────────┤
-               │                          │     │  periods         │
-               └────────────┬─────────────┘     │  ├─ company_id   │
-                            │                   │  ├─ quarter/year │
-                            │                   │  └─ pdf_hash     │
-                            │                   ├──────────────────┤
-                            │                   │  financial_data  │
-                            ▼                   │  ├─ period_id    │
-               ┌──────────────────────────┐     │  ├─ row_name     │
-               │  3. EXCEL-GENERERING     │     │  └─ value        │
-               │                          │     └──────────────────┘
-               │  a) AI-normalisering:    │
-               │     • Samla alla radnamn │
-               │     • Claude mappar till │
-               │       svenska termer     │
-               │                          │
-               │  b) Bygg Excel:          │
-               │     • Sortera perioder   │
-               │     • Skapa flikar       │
-               │     • Applicera styling  │
-               └────────────┬─────────────┘
-                            │
-                            ▼
-               ┌──────────────────────────┐
-               │  📊 databok.xlsx         │
-               │                          │
-               │  Flikar:                 │
-               │  • Resultaträkning       │
-               │  • Balansräkning         │
-               │  • Kassaflöde            │
-               │  (med --full:)           │
-               │  • Grafer                │
-               │  • VD-ord                │
-               │  • Marknadsöversikt      │
-               │  • ...fler textsektioner │
-               └──────────────────────────┘
+  PDF
+   │
+   ▼
+┌──────────────────────────────────────┐
+│  PASS 1: Strukturidentifiering       │
+│  Modell: Haiku (billig, snabb)       │
+│                                      │
+│  • Identifiera alla tabeller         │
+│  • Identifiera textsektioner         │
+│  • Identifiera grafer                │
+│  • Returnera "strukturkarta"         │
+└──────────────┬───────────────────────┘
+               │
+       ┌───────┴───────┐
+       │               │
+       ▼               ▼
+┌─────────────┐  ┌─────────────┐
+│  PASS 2     │  │  PASS 3     │
+│  Tabeller   │  │  Text       │
+│  (Sonnet)   │  │  (Haiku)    │
+│             │  │             │
+│  • Extrahera│  │  • Extrahera│
+│    tabeller │  │    sektioner│
+│  • Konvert. │  │  • Citat    │
+│    tal      │  │  • Kontakt  │
+│  • Grafer   │  │  • Kalender │
+└──────┬──────┘  └──────┬──────┘
+       │                │
+       │    PARALLELLT! │
+       └───────┬────────┘
+               │
+               ▼
+┌──────────────────────────────────────┐
+│  MERGE & SPARA                       │
+│  • Kombinera resultat                │
+│  • Spara till Supabase               │
+│  • Generera Excel                    │
+└──────────────────────────────────────┘
 ```
 
 ### Cache-logik
@@ -239,11 +240,11 @@ Vid upprepade körningar kontrolleras om PDF:en redan är extraherad:
                     ▼                           ▼
            ┌───────────────┐           ┌───────────────┐
            │ Ladda från DB │           │ Ny extraktion │
-           │ (0 kr)        │           │ (~1-2 kr)     │
+           │ (0 kr)        │           │ (~4-6 kr)     │
            └───────────────┘           └───────────────┘
 ```
 
-### Databasschema
+## Databasschema
 
 ```sql
 companies (1) ─────< periods (N) ─────< financial_data (N)
@@ -255,46 +256,55 @@ companies (1) ─────< periods (N) ─────< financial_data (N)
                         ├─ pdf_hash          ├─ value
                         └─ valuta            └─ row_type
 
-                    periods (1) ─────< sections (N)        -- Textsektioner
+                    periods (1) ─────< sections (N)
                                        ├─ title
-                                       ├─ page_number
                                        ├─ section_type
                                        └─ content
 
-                    periods (1) ─────< report_tables (N)   -- Alla tabeller (JSONB)
+                    periods (1) ─────< report_tables (N)
                                        ├─ title
                                        ├─ table_type
                                        ├─ columns (JSONB)
                                        └─ rows (JSONB)
 
-                    periods (1) ─────< charts (N)          -- Grafer/diagram
+                    periods (1) ─────< charts (N)
                                        ├─ title
                                        ├─ chart_type
-                                       ├─ estimated
                                        └─ data_points (JSONB)
 ```
-
-## Kostnader
-
-Verktyget använder Claude Sonnet 4 för:
-1. **PDF-extraktion** - extraherar finansiell data från varje PDF (~1-2 kr/rapport, ~4-5 kr med `--full`)
-2. **Radnormalisering** - matchar radnamn mellan kvartal för konsekvent Excel (~0.10-0.20 kr/körning)
-
-Kostnaden visas i realtid under körning och summeras efteråt.
 
 ## Projektstruktur
 
 ```
 rapport_extraktor/
 ├── main.py              # CLI-verktyg
-├── extractor.py         # Async PDF-extraktion via Claude API
-├── excel_builder.py     # Excel-generering med formatering + AI-normalisering
+├── pipeline.py          # Multi-pass extraktion (Haiku + Sonnet + Haiku)
+├── extractor.py         # Legacy single-pass extraktion
+├── excel_builder.py     # Excel-generering med IB-formatering
 ├── supabase_client.py   # Supabase databashantering
 ├── prompts.py           # Extraktions-prompter för Claude
 ├── schema.sql           # Databasschema för Supabase
 ├── requirements.txt     # Python-beroenden
 └── .env.example         # Mall för miljövariabler
 ```
+
+## CLI-flaggor
+
+| Flagga | Beskrivning |
+|--------|-------------|
+| `-i`, `--interactive` | Interaktivt läge |
+| `--multi-pass` | Multi-pass pipeline (Haiku + Sonnet + Haiku) |
+| `--full` | Full extraktion (all text och alla tabeller) |
+| `--company`, `-c` | Bolagsnamn |
+| `--output`, `-o` | Output Excel-fil |
+| `--add` | Lägg till PDF(er) till befintlig databok |
+| `--from-db` | Generera Excel från databas |
+| `--period`, `-p` | Filtrera på specifika perioder |
+| `--no-cache` | Ignorera cache, extrahera allt på nytt |
+| `--list-companies` | Lista alla bolag i databasen |
+| `--check-db` | Verifiera databassetup |
+| `--model` | Välj modell: sonnet (default) eller haiku |
+| `--streaming` | Använd streaming API |
 
 ## Next.js Integration
 
@@ -315,7 +325,7 @@ const { data: companies } = await supabase
 const { data } = await supabase
   .from('financial_data')
   .select('*, periods!inner(quarter, year, companies!inner(slug))')
-  .eq('periods.companies.slug', 'freemelt')
+  .eq('periods.companies.slug', 'bolagsnamn')
 ```
 
 ## Beroenden
