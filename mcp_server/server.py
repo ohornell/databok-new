@@ -25,7 +25,7 @@ import requests
 from dotenv import load_dotenv
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from mcp.types import Tool, TextContent, Prompt, PromptMessage, PromptArgument, GetPromptResult
 from supabase import create_client, Client
 
 # Ladda miljövariabler
@@ -130,35 +130,40 @@ def db_get_financials(company_slug: str, period: str | None = None, statement_ty
     company_id = company.data[0]["id"]
     company_name = company.data[0]["name"]
     
-    # Hitta period
+    # Hitta period (inkluderar source_file och pdf_hash direkt)
     if period:
         # Parsa "Q3 2024"
         import re
         match = re.search(r'Q(\d)\s*(\d{4})', period)
         if match:
             quarter, year = int(match.group(1)), int(match.group(2))
-            period_row = client.table("periods").select("id, quarter, year, valuta").eq(
-                "company_id", company_id
-            ).eq("quarter", quarter).eq("year", year).execute()
+            period_row = client.table("periods").select(
+                "id, quarter, year, valuta, source_file, pdf_hash"
+            ).eq("company_id", company_id).eq("quarter", quarter).eq("year", year).execute()
         else:
             return {"error": f"Ogiltigt periodformat: {period}. Använd t.ex. 'Q3 2024'"}
     else:
         # Senaste period
-        period_row = client.table("periods").select("id, quarter, year, valuta").eq(
-            "company_id", company_id
-        ).order("year", desc=True).order("quarter", desc=True).limit(1).execute()
-    
+        period_row = client.table("periods").select(
+            "id, quarter, year, valuta, source_file, pdf_hash"
+        ).eq("company_id", company_id).order("year", desc=True).order("quarter", desc=True).limit(1).execute()
+
     if not period_row.data:
         return {"error": f"Ingen period hittad för {company_name}"}
-    
-    period_id = period_row.data[0]["id"]
-    period_str = f"Q{period_row.data[0]['quarter']} {period_row.data[0]['year']}"
-    valuta = period_row.data[0].get("valuta", "TSEK")
-    
+
+    p = period_row.data[0]
+    period_id = p["id"]
+    period_str = f"Q{p['quarter']} {p['year']}"
+    valuta = p.get("valuta", "TSEK")
+
     result = {
         "company": company_name,
         "period": period_str,
         "valuta": valuta,
+        "source": {
+            "file": p.get("source_file"),
+            "pdf_hash": p.get("pdf_hash")
+        },
         "tables": {}
     }
     
@@ -225,28 +230,29 @@ def db_get_kpis(company_slug: str, period: str | None = None) -> dict:
     company_id = company.data[0]["id"]
     company_name = company.data[0]["name"]
 
-    # Hitta period
+    # Hitta period (inkluderar source_file och pdf_hash direkt)
     if period:
         import re
         match = re.search(r'Q(\d)\s*(\d{4})', period)
         if match:
             quarter, year = int(match.group(1)), int(match.group(2))
-            period_row = client.table("periods").select("id, quarter, year, valuta").eq(
-                "company_id", company_id
-            ).eq("quarter", quarter).eq("year", year).execute()
+            period_row = client.table("periods").select(
+                "id, quarter, year, valuta, source_file, pdf_hash"
+            ).eq("company_id", company_id).eq("quarter", quarter).eq("year", year).execute()
         else:
             return {"error": f"Ogiltigt periodformat: {period}. Använd t.ex. 'Q3 2024'"}
     else:
-        period_row = client.table("periods").select("id, quarter, year, valuta").eq(
-            "company_id", company_id
-        ).order("year", desc=True).order("quarter", desc=True).limit(1).execute()
+        period_row = client.table("periods").select(
+            "id, quarter, year, valuta, source_file, pdf_hash"
+        ).eq("company_id", company_id).order("year", desc=True).order("quarter", desc=True).limit(1).execute()
 
     if not period_row.data:
         return {"error": f"Ingen period hittad för {company_name}"}
 
-    period_id = period_row.data[0]["id"]
-    period_str = f"Q{period_row.data[0]['quarter']} {period_row.data[0]['year']}"
-    valuta = period_row.data[0].get("valuta", "TSEK")
+    p = period_row.data[0]
+    period_id = p["id"]
+    period_str = f"Q{p['quarter']} {p['year']}"
+    valuta = p.get("valuta", "TSEK")
 
     # Hämta KPI-tabeller från report_tables
     kpis = client.table("report_tables").select("*").eq(
@@ -257,6 +263,10 @@ def db_get_kpis(company_slug: str, period: str | None = None) -> dict:
         "company": company_name,
         "period": period_str,
         "valuta": valuta,
+        "source": {
+            "file": p.get("source_file"),
+            "pdf_hash": p.get("pdf_hash")
+        },
         "kpi_tables": [{
             "title": k["title"],
             "page": k["page_number"],
@@ -281,38 +291,43 @@ def db_get_sections(company_slug: str, period: str | None = None, section_type: 
     company_id = company.data[0]["id"]
     company_name = company.data[0]["name"]
     
-    # Hitta period
+    # Hitta period (inkluderar source_file och pdf_hash direkt)
     if period:
         import re
         match = re.search(r'Q(\d)\s*(\d{4})', period)
         if match:
             quarter, year = int(match.group(1)), int(match.group(2))
-            period_row = client.table("periods").select("id, quarter, year").eq(
-                "company_id", company_id
-            ).eq("quarter", quarter).eq("year", year).execute()
+            period_row = client.table("periods").select(
+                "id, quarter, year, source_file, pdf_hash"
+            ).eq("company_id", company_id).eq("quarter", quarter).eq("year", year).execute()
         else:
             return {"error": f"Ogiltigt periodformat: {period}"}
     else:
-        period_row = client.table("periods").select("id, quarter, year").eq(
-            "company_id", company_id
-        ).order("year", desc=True).order("quarter", desc=True).limit(1).execute()
-    
+        period_row = client.table("periods").select(
+            "id, quarter, year, source_file, pdf_hash"
+        ).eq("company_id", company_id).order("year", desc=True).order("quarter", desc=True).limit(1).execute()
+
     if not period_row.data:
         return {"error": f"Ingen period hittad för {company_name}"}
-    
-    period_id = period_row.data[0]["id"]
-    period_str = f"Q{period_row.data[0]['quarter']} {period_row.data[0]['year']}"
-    
+
+    p = period_row.data[0]
+    period_id = p["id"]
+    period_str = f"Q{p['quarter']} {p['year']}"
+
     # Hämta sektioner
     query = client.table("sections").select("title, section_type, page_number, content").eq("period_id", period_id)
     if section_type:
         query = query.eq("section_type", section_type)
-    
+
     sections = query.order("page_number").execute()
-    
+
     return {
         "company": company_name,
         "period": period_str,
+        "source": {
+            "file": p.get("source_file"),
+            "pdf_hash": p.get("pdf_hash")
+        },
         "sections": [{
             "title": s["title"],
             "type": s["section_type"],
@@ -345,24 +360,54 @@ def get_query_embedding(text: str) -> list[float] | None:
     return None
 
 
-def db_search_sections(query: str, company_slug: str | None = None, use_embedding: bool = False) -> list[dict]:
+def db_search_sections(query: str, company_slug: str | None = None, use_embedding: bool = False, use_hybrid: bool = True) -> list[dict]:
     """
     Sök i textsektioner.
 
     Args:
         query: Sökterm
         company_slug: Begränsa till ett bolag (valfritt)
-        use_embedding: Använd semantisk sökning med embeddings (kräver att embeddings finns)
+        use_embedding: Använd semantisk sökning med embeddings
+        use_hybrid: Använd hybrid sökning (text + semantisk) - default True
     """
     client = get_client()
 
-    # Embedding-sökning (om aktiverat och embeddings finns)
-    if use_embedding:
+    # Hybrid-sökning (kombinerar text + semantisk)
+    if use_hybrid or use_embedding:
         try:
-            # Generera embedding för sökfrågan
             query_embedding = get_query_embedding(query)
             if query_embedding:
-                # Anropa Supabase RPC-funktion för embedding-sökning
+                # Försök hybrid först
+                if use_hybrid:
+                    try:
+                        result = client.rpc("hybrid_search_sections", {
+                            "query_text": query,
+                            "query_embedding": query_embedding,
+                            "match_count": 10,
+                            "company_filter": company_slug,
+                            "text_weight": 0.3,
+                            "semantic_weight": 0.7
+                        }).execute()
+
+                        if result.data:
+                            return [{
+                                "company": r["company_name"],
+                                "period": f"Q{r['quarter']} {r['year']}",
+                                "section": r["title"],
+                                "type": r["section_type"],
+                                "page": r.get("page_number"),
+                                "excerpt": r["content"][:300] + "..." if len(r["content"]) > 300 else r["content"],
+                                "score": round(r.get("combined_score", 0), 3),
+                                "search_type": "hybrid",
+                                "source": {
+                                    "file": r.get("source_file"),
+                                    "period": f"Q{r['quarter']} {r['year']}"
+                                }
+                            } for r in result.data]
+                    except Exception:
+                        pass  # Fallback till ren semantisk sökning
+
+                # Fallback till ren semantisk sökning
                 result = client.rpc("match_sections", {
                     "query_embedding": query_embedding,
                     "match_count": 10,
@@ -375,11 +420,17 @@ def db_search_sections(query: str, company_slug: str | None = None, use_embeddin
                         "period": f"Q{r['quarter']} {r['year']}",
                         "section": r["title"],
                         "type": r["section_type"],
+                        "page": r.get("page_number"),
                         "excerpt": r["content"][:300] + "..." if len(r["content"]) > 300 else r["content"],
-                        "similarity": round(r.get("similarity", 0), 3)
+                        "score": round(r.get("similarity", 0), 3),
+                        "search_type": "semantic",
+                        "source": {
+                            "file": r.get("source_file"),
+                            "period": f"Q{r['quarter']} {r['year']}"
+                        }
                     } for r in result.data]
         except Exception:
-            # Fallback till textsökning om embedding-sökning misslyckas
+            # Fallback till textsökning
             pass
 
     # Textsökning (fallback)
@@ -403,19 +454,19 @@ def db_search_sections(query: str, company_slug: str | None = None, use_embeddin
 
         # Sök i sektioner för dessa perioder
         sections = client.table("sections").select(
-            "title, section_type, content, period_id"
+            "title, section_type, content, period_id, page_number"
         ).in_("period_id", period_ids).ilike("content", f"%{query}%").limit(10).execute()
     else:
         # Sök i alla sektioner
         sections = client.table("sections").select(
-            "title, section_type, content, period_id"
+            "title, section_type, content, period_id, page_number"
         ).ilike("content", f"%{query}%").limit(10).execute()
 
     results = []
     for s in sections.data:
-        # Hämta period-info
+        # Hämta period-info med source_file
         period = client.table("periods").select(
-            "quarter, year, company_id"
+            "quarter, year, company_id, source_file"
         ).eq("id", s["period_id"]).execute()
 
         if period.data:
@@ -441,7 +492,13 @@ def db_search_sections(query: str, company_slug: str | None = None, use_embeddin
                 "period": f"Q{p['quarter']} {p['year']}",
                 "section": s["title"],
                 "type": s["section_type"],
-                "excerpt": excerpt
+                "page": s.get("page_number"),
+                "excerpt": excerpt,
+                "search_type": "text",
+                "source": {
+                    "file": p.get("source_file"),
+                    "period": f"Q{p['quarter']} {p['year']}"
+                }
             })
 
     return results
@@ -466,6 +523,68 @@ def db_compare_periods(company_slug: str, period1: str, period2: str) -> dict:
     }
 
 
+def format_chart_data(data_points: list, chart_type: str = "bar") -> dict:
+    """Generera tabell och ASCII-visualisering från datapunkter."""
+    if not data_points:
+        return {"data_table": "", "data_visual": ""}
+
+    # Extrahera labels och värden
+    try:
+        # Hantera olika format av data_points
+        if isinstance(data_points[0], dict):
+            labels = [str(dp.get("label", dp.get("x", dp.get("name", f"#{i}"))))
+                      for i, dp in enumerate(data_points)]
+            values = [float(dp.get("value", dp.get("y", 0))) for dp in data_points]
+        elif isinstance(data_points[0], (list, tuple)):
+            labels = [str(dp[0]) for dp in data_points]
+            values = [float(dp[1]) if len(dp) > 1 else 0 for dp in data_points]
+        else:
+            return {"data_table": "", "data_visual": ""}
+    except (ValueError, TypeError, IndexError):
+        return {"data_table": "", "data_visual": ""}
+
+    if not values:
+        return {"data_table": "", "data_visual": ""}
+
+    # Bygg markdown-tabell
+    max_label_len = max(len(l) for l in labels) if labels else 6
+    table_lines = [
+        f"| {'Period':<{max_label_len}} | Värde |",
+        f"|{'-' * (max_label_len + 2)}|-------|"
+    ]
+    for label, value in zip(labels, values):
+        table_lines.append(f"| {label:<{max_label_len}} | {value:,.0f} |")
+    data_table = "\n".join(table_lines)
+
+    # Bygg ASCII-graf
+    max_value = max(abs(v) for v in values) if values else 1
+    bar_width = 30
+    visual_lines = []
+
+    for i, (label, value) in enumerate(zip(labels, values)):
+        # Beräkna stapelbredd
+        bar_len = int((abs(value) / max_value) * bar_width) if max_value > 0 else 0
+        bar = "█" * bar_len
+
+        # Beräkna förändring från föregående
+        if i > 0 and values[i-1] != 0:
+            change = ((value - values[i-1]) / abs(values[i-1])) * 100
+            change_str = f" ({change:+.0f}%)" if abs(change) > 0.5 else ""
+        else:
+            change_str = ""
+
+        # Formatera värde
+        value_str = f"{value:,.0f}"
+        visual_lines.append(f"{label:<8} |{bar} {value_str}{change_str}")
+
+    data_visual = "\n".join(visual_lines)
+
+    return {
+        "data_table": data_table,
+        "data_visual": data_visual
+    }
+
+
 def db_get_charts(company_slug: str, period: str | None = None) -> dict:
     """Hämta grafer/diagram för en period."""
     client = get_client()
@@ -481,36 +600,36 @@ def db_get_charts(company_slug: str, period: str | None = None) -> dict:
     company_id = company.data[0]["id"]
     company_name = company.data[0]["name"]
     
-    # Hitta period
+    # Hitta period (inkluderar source_file och pdf_hash direkt)
     if period:
         import re
         match = re.search(r'Q(\d)\s*(\d{4})', period)
         if match:
             quarter, year = int(match.group(1)), int(match.group(2))
-            period_row = client.table("periods").select("id, quarter, year").eq(
-                "company_id", company_id
-            ).eq("quarter", quarter).eq("year", year).execute()
+            period_row = client.table("periods").select(
+                "id, quarter, year, source_file, pdf_hash"
+            ).eq("company_id", company_id).eq("quarter", quarter).eq("year", year).execute()
         else:
             return {"error": f"Ogiltigt periodformat: {period}"}
     else:
-        period_row = client.table("periods").select("id, quarter, year").eq(
-            "company_id", company_id
-        ).order("year", desc=True).order("quarter", desc=True).limit(1).execute()
-    
+        period_row = client.table("periods").select(
+            "id, quarter, year, source_file, pdf_hash"
+        ).eq("company_id", company_id).order("year", desc=True).order("quarter", desc=True).limit(1).execute()
+
     if not period_row.data:
         return {"error": f"Ingen period hittad för {company_name}"}
-    
-    period_id = period_row.data[0]["id"]
-    period_str = f"Q{period_row.data[0]['quarter']} {period_row.data[0]['year']}"
-    
+
+    p = period_row.data[0]
+    period_id = p["id"]
+    period_str = f"Q{p['quarter']} {p['year']}"
+
     # Hämta grafer
     try:
         charts = client.table("charts").select("*").eq("period_id", period_id).order("page_number").execute()
 
-        return {
-            "company": company_name,
-            "period": period_str,
-            "charts": [{
+        formatted_charts = []
+        for c in charts.data:
+            formatted_charts.append({
                 "title": c["title"],
                 "type": c["chart_type"],
                 "page": c["page_number"],
@@ -518,12 +637,25 @@ def db_get_charts(company_slug: str, period: str | None = None) -> dict:
                 "y_axis": c.get("y_axis"),
                 "estimated": c["estimated"],
                 "data_points": c["data_points"]
-            } for c in charts.data]
+            })
+
+        return {
+            "company": company_name,
+            "period": period_str,
+            "source": {
+                "file": p.get("source_file"),
+                "pdf_hash": p.get("pdf_hash")
+            },
+            "charts": formatted_charts
         }
     except Exception:
         return {
             "company": company_name,
             "period": period_str,
+            "source": {
+                "file": p.get("source_file"),
+                "pdf_hash": p.get("pdf_hash")
+            },
             "charts": [],
             "note": "Inga grafer tillgängliga (charts-tabellen saknas)"
         }
@@ -630,7 +762,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="search_sections",
-            description="Sök i alla textsektioner efter specifika termer eller ämnen. Stöder semantisk sökning med embeddings.",
+            description="Sök i alla textsektioner efter specifika termer eller ämnen. Använder hybrid sökning (text + semantisk) som default för bästa resultat.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -642,9 +774,9 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Begränsa sökning till ett bolag (valfritt)"
                     },
-                    "use_embedding": {
+                    "use_hybrid": {
                         "type": "boolean",
-                        "description": "Använd semantisk sökning med AI-embeddings (default: false)"
+                        "description": "Använd hybrid sökning (text + semantisk). Default: true"
                     }
                 },
                 "required": ["query"]
@@ -693,6 +825,114 @@ async def list_tools() -> list[Tool]:
     ]
 
 
+@server.list_prompts()
+async def list_prompts() -> list[Prompt]:
+    """Definiera tillgängliga prompts."""
+    return [
+        Prompt(
+            name="welcome",
+            description="Välkomstmeddelande som förklarar vad MCP:n kan göra",
+            arguments=[]
+        ),
+        Prompt(
+            name="search_guide",
+            description="Guide för hur sökning fungerar",
+            arguments=[]
+        )
+    ]
+
+
+@server.get_prompt()
+async def get_prompt(name: str, arguments: dict[str, str] | None = None) -> GetPromptResult:
+    """Hämta en prompt."""
+    if name == "welcome":
+        return GetPromptResult(
+            description="Välkomstmeddelande för Rapport Extraktor",
+            messages=[PromptMessage(
+                role="user",
+                content=TextContent(
+                    type="text",
+                    text="""# Rapport Extraktor MCP
+
+Jag har tillgång till en databas med finansiella rapporter. Här är vad jag kan hjälpa dig med:
+
+## Tillgängliga verktyg
+
+| Verktyg | Beskrivning |
+|---------|-------------|
+| `list_companies` | Lista alla bolag i databasen |
+| `get_periods` | Visa tillgängliga kvartal för ett bolag |
+| `get_financials` | Hämta resultat/balans/kassaflöde |
+| `get_kpis` | Hämta nyckeltal (marginaler, tillväxt) |
+| `get_sections` | Hämta textsektioner (VD-kommentar, etc.) |
+| `search_sections` | Sök i alla textsektioner (hybrid: text + AI) |
+| `compare_periods` | Jämför två perioder |
+| `get_charts` | Hämta extraherade grafer med datapunkter |
+
+## Exempel på frågor
+
+- "Vilka bolag finns i databasen?"
+- "Visa Vitrolifes resultaträkning för Q3 2024"
+- "Sök efter information om tillväxt"
+- "Jämför Q3 2024 med Q3 2023 för Vitrolife"
+- "Vad säger VD:n i senaste rapporten?"
+
+## Källhänvisningar
+
+All data inkluderar källhänvisningar (PDF-fil, period, sidnummer) för spårbarhet.
+
+Vad vill du veta?"""
+                )
+            )]
+        )
+
+    elif name == "search_guide":
+        return GetPromptResult(
+            description="Guide för sökning i rapporter",
+            messages=[PromptMessage(
+                role="user",
+                content=TextContent(
+                    type="text",
+                    text="""# Sökguide
+
+## Sökmetoder
+
+När du söker använder jag **hybrid sökning** som kombinerar:
+- **Textsökning** (30%): Hittar exakta ordmatchningar
+- **Semantisk sökning** (70%): Förstår betydelse och kontext med AI
+
+## Så här fungerar det
+
+1. Du ställer en fråga, t.ex. "Sök efter lönsamhetsförbättringar"
+2. Jag genererar en AI-embedding för din fråga
+3. Söker både på exakta ord OCH liknande begrepp
+4. Returnerar de mest relevanta resultaten med poäng
+
+## Tips för bättre sökningar
+
+- Använd beskrivande fraser: "tillväxtstrategi" istället för "tillväxt"
+- Kombinera bolagsnamn + ämne: "Vitrolife förvärv"
+- Semantisk sökning förstår synonymer: "vinst" hittar även "resultat"
+
+## Resultatformat
+
+Varje resultat visar:
+- Bolag och period
+- Sektion och sidnummer
+- Relevanspoäng (0-1)
+- Sökmetod (hybrid/semantic/text)
+- Källfil för spårbarhet"""
+                )
+            )]
+        )
+
+    # Fallback för okänd prompt
+    return GetPromptResult(
+        description="Okänd prompt",
+        messages=[]
+    )
+
+
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     """Hantera verktygsanrop."""
@@ -727,7 +967,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             result = db_search_sections(
                 arguments["query"],
                 arguments.get("company"),
-                arguments.get("use_embedding", False)
+                use_hybrid=arguments.get("use_hybrid", True)
             )
         
         elif name == "compare_periods":
