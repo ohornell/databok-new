@@ -45,12 +45,30 @@ class ValidationResult:
 
 # Mönster som indikerar ogiltiga labels
 INVALID_LABEL_PATTERNS = [
-    r'^(\d+)$',                    # Bara siffror: "1", "2", "123"
     r'^label:\s*\d+$',             # "label: 1", "label:2"
     r'^row\s*\d+$',                # "row 1", "row2"
     r'^rad\s*\d+$',                # "rad 1", "rad2"
     r'^\s*$',                      # Tom eller bara whitespace
 ]
+
+# År som kan förekomma i tabellrader (inte ogiltiga labels)
+VALID_YEAR_PATTERNS = [
+    r'^(19|20)\d{2}$',             # 1900-2099: "2025", "2026", etc.
+]
+
+
+def is_valid_year(label: str) -> bool:
+    """
+    Kontrollera om label är ett giltigt årtal.
+    
+    År är ofta legitima row labels i finansiella tabeller,
+    t.ex. "2025", "2026" i forward contract overview.
+    """
+    label_stripped = label.strip()
+    for pattern in VALID_YEAR_PATTERNS:
+        if re.match(pattern, label_stripped):
+            return True
+    return False
 
 
 def is_invalid_label(label: str) -> bool:
@@ -58,12 +76,19 @@ def is_invalid_label(label: str) -> bool:
     Kontrollera om en label är ogiltig.
 
     Ogiltiga labels:
-    - Bara siffror
-    - Generiska placeholders som "label: 1"
+    - Generiska placeholders som "label: 1", "row 1"
     - Tomma strängar
+    
+    INTE ogiltiga:
+    - År (2025, 2026, etc.) - ofta legitima row labels
+    - Andra numeriska värden som kan vara identifierare
     """
     if not label:
         return True
+
+    # År är alltid giltiga
+    if is_valid_year(label):
+        return False
 
     label_lower = label.lower().strip()
 
@@ -123,15 +148,20 @@ def validate_table(table: dict) -> list[ValidationError]:
             ))
 
         # Validering 4: Första värdet ska vara null (label-kolumnen)
+        # Undantag: årtal som första värde är OK (t.ex. Forward contract overview)
         if values and values[0] is not None:
-            errors.append(ValidationError(
-                table_id=table_id,
-                table_title=table_title,
-                error_type="first_value_not_null",
-                message=f"Rad '{label}' har första värdet {values[0]} istället för null",
-                row_index=i,
-                severity="warning"
-            ))
+            first_val = values[0]
+            # Skippa varning om första värdet är ett årtal (1900-2099)
+            is_year_value = isinstance(first_val, (int, str)) and str(first_val).isdigit() and 1900 <= int(first_val) <= 2099
+            if not is_year_value:
+                errors.append(ValidationError(
+                    table_id=table_id,
+                    table_title=table_title,
+                    error_type="first_value_not_null",
+                    message=f"Rad '{label}' har forsta vardet {values[0]} istallet for null",
+                    row_index=i,
+                    severity="warning"
+                ))
 
     return errors
 

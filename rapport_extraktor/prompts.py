@@ -72,15 +72,24 @@ GÅ IGENOM VARJE SIDA och hitta:
 
 □ Finansiella rapporter (resultat, balans, kassaflöde, EK-förändring)
 □ Kvartalssammanställningar (Q1-Q4, flera år) - ofta SIST i dokumentet!
-□ Segment/region/produkt-data
+□ Segment/region/produkt-data (intäkter per division, geografi)
 □ Tillväxt-tabeller (%, förändringar)
-□ Nyckeltal
+□ Nyckeltal (KPIs, ratios)
 □ Noter
+□ Aktiedata (aktieantal, ägarstruktur, utdelning)
+□ Personaldata (headcount, anställda per division)
+□ Kostnadsanalys (operating costs, compensation)
+□ Kapitalstruktur (core capital, regulatory ratios)
+□ Marknadsvolymer (ECM, DCM, M&A volumes)
+□ Forward contracts / terminkontrakt
 
 TABELLTYPER:
 income_statement, balance_sheet, cash_flow, equity_changes,
 parent_income_statement, parent_balance_sheet,
-quarterly, kpi, segment, growth, note, other
+quarterly, kpi, segment, growth, note, shareholder, personnel, costs, capital, market_volumes, other
+
+OBS: Det kan finnas andra tabelltyper som inte listas ovan.
+Identifiera och inkludera ALLA tabeller oavsett typ - använd "other" för okända typer.
 
 TABELL-FORMAT:
 {
@@ -147,6 +156,16 @@ STRUKTURKARTA:
 {structure_map_json}
 
 EXTRAHERA DESSA ELEMENT: {element_ids}
+
+==============================================================================
+KRITISKT - EXTRAHERA ALLA TABELLER!
+==============================================================================
+
+Du MÅSTE extrahera VARJE tabell i listan ovan. Missa INGEN tabell!
+- Varje tabell-ID i listan MÅSTE finnas i din output
+- Om en tabell är svår att läsa - gör ditt bästa, men inkludera den ALLTID
+- Hellre en tabell med några osäkra värden än en saknad tabell
+- Kontrollera att antal tabeller i output matchar antal i input-listan
 
 RETURNERA JSON:
 

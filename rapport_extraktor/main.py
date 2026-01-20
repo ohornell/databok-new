@@ -88,7 +88,7 @@ def print_pipeline_details(results: list[dict]):
             retry_cost = retry_stats.get("cost_sek", 0)
             retry_count = retry_stats.get("retry_count", 0)
             total_time += retry_time
-            print(f"   Retry({retry_count}) {'sonnet':<8} {retry_time:>5.1f}s   {retry_input:>8,}   {retry_output:>8,}   {retry_cost:>7.4f} kr")
+            print(f"   Retry({retry_count}) {'haiku':<8} {retry_time:>5.1f}s   {retry_input:>8,}   {retry_output:>8,}   {retry_cost:>7.4f} kr")
 
         total_cost = pipeline_info.get("total_cost_sek", 0)
         print(f"   {'-'*54}")
@@ -447,14 +447,24 @@ def run_interactive_mode(pdf_path: str | None = None):
         # === KONTROLLERA CACHE ===
         pdf_hash = get_pdf_hash(str(path))
 
-        # Försök hitta period från filnamn
+        # Försök hitta period från filnamn (stöd både "q1-2025" och "2025-q1")
         period_match = re.search(r'[qQ](\d)[_-]?(\d{4})', path.stem)
         skip_extraction = False
         extracted_period = None
+        quarter = None
+        year = None
 
         if period_match:
             quarter = int(period_match.group(1))
             year = int(period_match.group(2))
+        else:
+            # Alternativt format: 2025-q1
+            period_match = re.search(r'(\d{4})[_-]?[qQ](\d)', path.stem)
+            if period_match:
+                year = int(period_match.group(1))
+                quarter = int(period_match.group(2))
+
+        if quarter and year:
             extracted_period = f"Q{quarter} {year}"
 
             if period_exists(company["id"], quarter, year, pdf_hash):
@@ -491,6 +501,35 @@ def run_interactive_mode(pdf_path: str | None = None):
                 print(f"\n✅ Extraktion klar! Data sparad till databasen.")
                 print(f"   Bolag:  {company_name}")
                 print(f"   Period: {extracted_period}")
+
+                # Visa extraktionssammanfattning
+                result = successful[0]
+                tables = result.get("tables", [])
+                sections = result.get("sections", [])
+                charts = result.get("charts", [])
+                print(f"\n   📊 Extraherat:")
+                print(f"      Tabeller: {len(tables)} st")
+                print(f"      Sektioner: {len(sections)} st")
+                print(f"      Grafer: {len(charts)} st")
+
+                # Visa valideringsinfo
+                pipeline_info = result.get("_pipeline_info", {})
+                validation = pipeline_info.get("validation", {})
+                table_validation = validation.get("tables", {})
+                if table_validation:
+                    error_count = table_validation.get("error_count", 0)
+                    warning_count = table_validation.get("warning_count", 0)
+                    if error_count == 0:
+                        print(f"      Validering: ✓ OK")
+                    else:
+                        print(f"      Validering: {error_count} fel")
+                        for err in table_validation.get("errors", []):
+                            print(f"         - {err.get('table_title', '?')}: {err.get('message', '?')}")
+
+                # Visa retry-info
+                retry_stats = pipeline_info.get("retry_stats", {})
+                if retry_stats.get("retry_count", 0) > 0:
+                    print(f"      Retry: {retry_stats.get('tables_retried', 0)} tabeller fixade")
 
                 # Visa pipeline-detaljer
                 print_pipeline_details(successful)
@@ -623,6 +662,22 @@ def run_interactive_mode(pdf_path: str | None = None):
             print("\nMisslyckade filer:")
             for path_str, error in failed:
                 print(f"   - {Path(path_str).name}: {error}")
+
+        # Visa extraktionssammanfattning per fil
+        if successful:
+            print(f"\n📊 Extraktionsresultat:")
+            for result in successful:
+                period = result.get("metadata", {}).get("period", "?")
+                tables = result.get("tables", [])
+                sections = result.get("sections", [])
+                pipeline_info = result.get("_pipeline_info", {})
+                validation = pipeline_info.get("validation", {}).get("tables", {})
+                error_count = validation.get("error_count", 0)
+                retry_stats = pipeline_info.get("retry_stats", {})
+
+                status = "✓" if error_count == 0 else f"{error_count} fel"
+                retry_info = f" (retry: {retry_stats.get('tables_retried', 0)} fixade)" if retry_stats.get("retry_count", 0) > 0 else ""
+                print(f"   {period}: {len(tables)} tabeller, {len(sections)} sektioner - {status}{retry_info}")
 
         # Visa pipeline-detaljer
         if successful:
@@ -957,6 +1012,22 @@ Exempel:
         print("\nMisslyckade filer:")
         for path, error in failed:
             print(f"   • {Path(path).name}: {error}")
+
+    # Visa extraktionssammanfattning per fil
+    if successful:
+        print(f"\n📊 Extraktionsresultat:")
+        for result in successful:
+            period = result.get("metadata", {}).get("period", "?")
+            tables = result.get("tables", [])
+            sections = result.get("sections", [])
+            pipeline_info = result.get("_pipeline_info", {})
+            validation = pipeline_info.get("validation", {}).get("tables", {})
+            error_count = validation.get("error_count", 0)
+            retry_stats = pipeline_info.get("retry_stats", {})
+
+            status = "✓" if error_count == 0 else f"{error_count} fel"
+            retry_info = f" (retry: {retry_stats.get('tables_retried', 0)} fixade)" if retry_stats.get("retry_count", 0) > 0 else ""
+            print(f"   {period}: {len(tables)} tabeller, {len(sections)} sektioner - {status}{retry_info}")
 
     # Visa pipeline-detaljer
     if successful:

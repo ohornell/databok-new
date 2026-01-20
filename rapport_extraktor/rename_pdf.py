@@ -413,32 +413,41 @@ class PdfRenameHandler(FileSystemEventHandler):
         rename_pdf(str(path), self.dry_run)
 
 
-def watch_folder(folder: str, dry_run: bool = False):
-    """Övervaka en mapp och döp om nya PDF-filer automatiskt."""
+def watch_folders(folders: list, dry_run: bool = False):
+    """Övervaka en eller flera mappar och döp om nya PDF-filer automatiskt."""
     if not WATCHDOG_AVAILABLE:
         print("[!] watchdog behövs för --watch")
         print("    Installera: pip install watchdog")
         sys.exit(1)
 
-    folder_path = Path(folder)
-    if not folder_path.exists():
-        print(f"[!] Mappen hittades inte: {folder}")
-        sys.exit(1)
+    # Validera alla mappar
+    folder_paths = []
+    for folder in folders:
+        folder_path = Path(folder)
+        if not folder_path.exists():
+            print(f"[!] Mappen hittades inte: {folder}")
+            sys.exit(1)
+        folder_paths.append(folder_path)
 
     print(f"\n{'=' * 50}")
-    print(f"WATCHDOG - Övervakar: {folder_path}")
+    print(f"WATCHDOG - Övervakar {len(folders)} mappar:")
+    for fp in folder_paths:
+        print(f"  • {fp}")
     print(f"{'=' * 50}")
     if dry_run:
         print("[DRY-RUN MODE]")
     print("Tryck Ctrl+C för att avsluta\n")
 
-    # Kör batch först för befintliga filer
-    batch_rename(folder, dry_run)
+    # Kör batch först för befintliga filer i varje mapp
+    for folder in folders:
+        batch_rename(folder, dry_run)
 
-    # Starta övervakning
-    event_handler = PdfRenameHandler(dry_run)
+    # Starta övervakning för alla mappar
     observer = Observer()
-    observer.schedule(event_handler, folder, recursive=False)
+    for folder in folders:
+        event_handler = PdfRenameHandler(dry_run)
+        observer.schedule(event_handler, folder, recursive=False)
+
     observer.start()
 
     try:
@@ -450,28 +459,37 @@ def watch_folder(folder: str, dry_run: bool = False):
     observer.join()
 
 
+def watch_folder(folder: str, dry_run: bool = False):
+    """Övervaka en mapp och döp om nya PDF-filer automatiskt."""
+    watch_folders([folder], dry_run)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Automatisk namngivning av PDF-rapporter (gratis)"
     )
 
-    parser.add_argument("path", help="PDF-fil eller mapp")
+    parser.add_argument("path", nargs="+", help="En eller flera PDF-filer/mappar")
     parser.add_argument("--dry-run", "-n", action="store_true",
                         help="Visa vad som skulle göras")
     parser.add_argument("--batch", "-b", action="store_true",
-                        help="Behandla som mapp")
+                        help="Behandla som mapp(ar)")
     parser.add_argument("--watch", "-w", action="store_true",
-                        help="Övervaka mapp och döp om nya filer automatiskt")
+                        help="Övervaka mapp(ar) och döp om nya filer automatiskt")
 
     args = parser.parse_args()
-    path = Path(args.path)
+    paths = args.path
 
     if args.watch:
-        watch_folder(args.path, args.dry_run)
-    elif args.batch or path.is_dir():
-        batch_rename(args.path, args.dry_run)
+        # Watch-läge kan hantera flera mappar
+        watch_folders(paths, args.dry_run)
+    elif args.batch or len(paths) > 1 or Path(paths[0]).is_dir():
+        # Batch-läge för mappar
+        for path in paths:
+            batch_rename(path, args.dry_run)
     else:
-        rename_pdf(args.path, args.dry_run)
+        # Enkelfil-läge
+        rename_pdf(paths[0], args.dry_run)
 
 
 if __name__ == "__main__":
