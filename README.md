@@ -48,6 +48,11 @@ cd rapport_extraktor
 pip install -r requirements.txt
 ```
 
+Om `pip` inte fungerar, prova:
+```bash
+py -m pip install -r requirements.txt
+```
+
 ## Konfiguration
 
 ### Anthropic API

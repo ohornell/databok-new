@@ -30,9 +30,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from extractor import extract_all_pdfs, load_cached_extractions
+from pipeline import extract_all_pdfs_multi_pass
 from excel_builder import build_databook
-from supabase_client import list_companies, get_or_create_company, slugify, check_database_setup
+from supabase_client import list_companies, get_or_create_company, slugify, check_database_setup, load_all_periods
 
 # Ladda miljövariabler
 load_dotenv()
@@ -56,14 +56,14 @@ def calculate_cost(input_tokens: int, output_tokens: int, model: str = "sonnet")
 
 
 def print_pipeline_details(results: list[dict]):
-    """Visa detaljerad timing och kostnad per pass för multi-pass extraktion."""
+    """Visa detaljerad timing och kostnad per pass for multi-pass extraktion."""
     for result in results:
         pipeline_info = result.get("_pipeline_info")
         if not pipeline_info:
             continue
 
         period = result.get("metadata", {}).get("period", "?")
-        print(f"\n📊 {period} - Pipeline detaljer:")
+        print(f"\n[i] {period} - Pipeline detaljer:")
         print(f"   {'Pass':<8} {'Modell':<8} {'Tid':<8} {'Input':<10} {'Output':<10} {'Kostnad':<10}")
         print(f"   {'-'*54}")
 
@@ -78,6 +78,17 @@ def print_pipeline_details(results: list[dict]):
             total_time += elapsed
 
             print(f"   Pass {pass_num:<3} {model:<8} {elapsed:>5.1f}s   {input_tok:>8,}   {output_tok:>8,}   {cost:>7.4f} kr")
+
+        # Visa retry-statistik om det finns
+        retry_stats = pipeline_info.get("retry_stats", {})
+        if retry_stats.get("retry_count", 0) > 0:
+            retry_time = retry_stats.get("elapsed_seconds", 0)
+            retry_input = retry_stats.get("input_tokens", 0)
+            retry_output = retry_stats.get("output_tokens", 0)
+            retry_cost = retry_stats.get("cost_sek", 0)
+            retry_count = retry_stats.get("retry_count", 0)
+            total_time += retry_time
+            print(f"   Retry({retry_count}) {'sonnet':<8} {retry_time:>5.1f}s   {retry_input:>8,}   {retry_output:>8,}   {retry_cost:>7.4f} kr")
 
         total_cost = pipeline_info.get("total_cost_sek", 0)
         print(f"   {'-'*54}")
@@ -105,6 +116,7 @@ def create_progress_tracker(pdf_paths: list[str]):
         "status": "pending",
         "input": 0,
         "output": 0,
+        "cost": 0.0,
         "start_time": None,
         "elapsed": 0,
     } for p in pdf_paths}
@@ -112,6 +124,7 @@ def create_progress_tracker(pdf_paths: list[str]):
     state = {
         "total_input_tokens": 0,
         "total_output_tokens": 0,
+        "total_cost": 0.0,
         "cached": 0,
         "failed": 0,
         "start_time": time.time(),
@@ -138,7 +151,7 @@ def create_progress_tracker(pdf_paths: list[str]):
             elif info["status"] == "done":
                 icon = "[X]"
                 tokens = info["input"] + info["output"]
-                cost = calculate_cost(info["input"], info["output"])
+                cost = info["cost"]
                 details = f"{tokens:,} tok | {cost:.2f} kr | {format_time(info['elapsed'])}"
             elif info["status"] == "failed":
                 icon = "[!]"
@@ -151,7 +164,7 @@ def create_progress_tracker(pdf_paths: list[str]):
 
         # Totalt
         total_tokens = state["total_input_tokens"] + state["total_output_tokens"]
-        total_cost = calculate_cost(state["total_input_tokens"], state["total_output_tokens"])
+        total_cost = state["total_cost"]
         elapsed = time.time() - state["start_time"]
         print(f"    Totalt: {total_tokens:,} tokens | {total_cost:.2f} kr | {format_time(elapsed)}")
         sys.stdout.flush()
@@ -171,8 +184,10 @@ def create_progress_tracker(pdf_paths: list[str]):
             if token_info:
                 files[path_key]["input"] = token_info["input_tokens"]
                 files[path_key]["output"] = token_info["output_tokens"]
+                files[path_key]["cost"] = token_info.get("cost_sek", 0.0)
                 state["total_input_tokens"] += token_info["input_tokens"]
                 state["total_output_tokens"] += token_info["output_tokens"]
+                state["total_cost"] += token_info.get("cost_sek", 0.0)
         elif status.startswith("failed"):
             files[path_key]["status"] = "failed"
             state["failed"] += 1
@@ -275,18 +290,19 @@ def run_interactive_mode(pdf_path: str | None = None):
     print(f"{'═' * 50}")
 
     if not all_periods:
-        print("\n❌ Inga perioder finns för detta bolag.")
+        print("\n[!] Inga perioder finns for detta bolag.")
         print("   Vill du extrahera en ny rapport?")
         extract_new = input("   [Y/n] > ").strip().upper()
         if extract_new == "N":
             return
         # Gå till extraktion
-        mode_choice = "2"
+        mode_choice = "3"
     else:
-        print("\nVad vill du göra?")
-        print("   1) Skapa fullständig databok (alla perioder)")
-        print("   2) Skapa databok för ett specifikt kvartal")
-        print("   3) Extrahera nytt kvartal från PDF")
+        print("\nVad vill du gora?")
+        print("   1) Skapa fullstandig databok (alla perioder)")
+        print("   2) Skapa databok for ett specifikt kvartal")
+        print("   3) Extrahera nytt kvartal fran PDF")
+        print("   4) Batch-extraktion (mapp med flera PDFs)")
         mode_choice = input("\n> ").strip()
 
     # === LÄGE 1: FULLSTÄNDIG DATABOK ===
@@ -393,23 +409,8 @@ def run_interactive_mode(pdf_path: str | None = None):
             print(f"❌ Fil hittades inte: {path}")
             return
 
-        # Extraktionstyp
-        print("\nExtraktionstyp:")
-        print("   1) Standard (endast finansiella rapporter)")
-        print("   2) Full (ALL text och alla tabeller)")
-        print("   3) Multi-pass (Haiku + Sonnet + Haiku)")
-        extraction_choice = input("> ").strip()
-        full_extraction = extraction_choice == "2"
-        use_multi_pass = extraction_choice == "3"
-
-        # Modell (endast om inte multi-pass)
-        model = "sonnet"
-        if not use_multi_pass:
-            print("\nModell:")
-            print("   1) Sonnet (rekommenderas)")
-            print("   2) Haiku (billigare, mindre kapabel)")
-            model_choice = input("> ").strip()
-            model = "haiku" if model_choice == "2" else "sonnet"
+        # Multi-pass är nu standard
+        print("\nAnvänder multi-pass pipeline (Haiku + Sonnet + Haiku)")
 
         # === KONTROLLERA CACHE ===
         pdf_hash = get_pdf_hash(str(path))
@@ -436,35 +437,20 @@ def run_interactive_mode(pdf_path: str | None = None):
         if not skip_extraction:
             print("\n📊 Startar extraktion...\n")
 
-            # Automatisk streaming för stora filer eller full extraktion
+            # Automatisk streaming för stora filer
             pdf_size = path.stat().st_size
-            use_streaming = pdf_size > 1_000_000 or full_extraction
+            use_streaming = pdf_size > 1_000_000
 
             on_progress, state = create_progress_tracker([str(path)])
 
-            if use_multi_pass:
-                print("🔄 Multi-pass pipeline...")
-                from pipeline import extract_all_pdfs_multi_pass
-                successful, failed = asyncio.run(
-                    extract_all_pdfs_multi_pass(
-                        [str(path)],
-                        company_name,
-                        on_progress,
-                        use_cache=False,
-                    )
+            successful, failed = asyncio.run(
+                extract_all_pdfs_multi_pass(
+                    [str(path)],
+                    company_name,
+                    on_progress,
+                    use_cache=False,
                 )
-            else:
-                successful, failed = asyncio.run(
-                    extract_all_pdfs(
-                        [str(path)],
-                        company_name,
-                        on_progress,
-                        use_cache=False,
-                        full_extraction=full_extraction,
-                        use_streaming=use_streaming,
-                        model=model
-                    )
-                )
+            )
             print()
 
             if successful:
@@ -473,14 +459,10 @@ def run_interactive_mode(pdf_path: str | None = None):
                 print(f"   Bolag:  {company_name}")
                 print(f"   Period: {extracted_period}")
 
-                # Visa pipeline-detaljer för multi-pass
-                if use_multi_pass:
-                    print_pipeline_details(successful)
-                    # Hämta kostnad från pipeline_info
-                    extraction_cost = successful[0].get("_pipeline_info", {}).get("total_cost_sek", 0)
-                else:
-                    extraction_cost = calculate_cost(state["total_input_tokens"], state["total_output_tokens"])
-                    print(f"   Kostnad: {extraction_cost:.2f} kr")
+                # Visa pipeline-detaljer
+                print_pipeline_details(successful)
+                # Hämta kostnad från pipeline_info
+                extraction_cost = successful[0].get("_pipeline_info", {}).get("total_cost_sek", 0)
             else:
                 print("\n❌ Extraktion misslyckades")
                 for path_str, error in failed:
@@ -539,10 +521,125 @@ def run_interactive_mode(pdf_path: str | None = None):
             print(f"\n💰 Normaliseringskostnad: {norm_cost:.2f} kr")
 
         if total_cost > 0:
-            print(f"💰 Total kostnad: {total_cost:.2f} kr")
+            print(f"[$$] Total kostnad: {total_cost:.2f} kr")
+
+    # === LAGE 4: BATCH-EXTRAKTION ===
+    elif mode_choice == "4":
+        print(f"\n{'=' * 50}")
+        print("               BATCH-EXTRAKTION")
+        print(f"{'=' * 50}\n")
+
+        # Fraga om mappsokväg
+        folder_input = input("Sokvag till mapp med PDF-filer: ").strip()
+        if not folder_input:
+            print("[!] Ingen sokvag angiven.")
+            return
+
+        folder_path = Path(folder_input)
+        if not folder_path.exists():
+            print(f"[!] Mappen hittades inte: {folder_path}")
+            return
+
+        if not folder_path.is_dir():
+            print(f"[!] Sokvagen ar inte en mapp: {folder_path}")
+            return
+
+        # Hitta alla PDFs i mappen
+        pdf_files = sorted(folder_path.glob("*.pdf"))
+        if not pdf_files:
+            print(f"[!] Inga PDF-filer hittades i {folder_path}")
+            return
+
+        pdf_path_strs = [str(p) for p in pdf_files]
+
+        print(f"\nHittade {len(pdf_files)} PDF-fil(er):")
+        for p in pdf_files[:10]:  # Visa max 10 filer
+            print(f"   - {p.name}")
+        if len(pdf_files) > 10:
+            print(f"   ... och {len(pdf_files) - 10} till")
+
+        # Bekrafta
+        confirm = input(f"\nStarta batch-extraktion for {company_name}? [Y/n]: ").strip().upper()
+        if confirm == "N":
+            print("Avbruten.")
+            return
+
+        # Extraktion
+        print("\n[~] Startar batch-extraktion...\n")
+
+        on_progress, state = create_progress_tracker(pdf_path_strs)
+
+        successful, failed = asyncio.run(
+            extract_all_pdfs_multi_pass(
+                pdf_path_strs,
+                company_name,
+                on_progress,
+                use_cache=True,
+            )
+        )
+        print()
+
+        # Sammanfattning
+        print(f"\n{'=' * 50}")
+        print(f"[OK] Lyckades:  {len(successful)}")
+        if state["cached"] > 0:
+            print(f"[C]  Cachade:   {state['cached']} (0 kr)")
+        if failed:
+            print(f"[!]  Fel:       {len(failed)}")
+            print("\nMisslyckade filer:")
+            for path_str, error in failed:
+                print(f"   - {Path(path_str).name}: {error}")
+
+        # Visa pipeline-detaljer
+        if successful:
+            print_pipeline_details(successful)
+
+        # Kostnadssammanfattning - summera fran pipeline_info (korrekt per modell)
+        if successful:
+            total_cost = sum(
+                r.get("_pipeline_info", {}).get("total_cost_sek", 0)
+                for r in successful
+            )
+            total_tokens = state["total_input_tokens"] + state["total_output_tokens"]
+            print(f"\n[$$] Total kostnad: {total_cost:.2f} kr ({total_tokens:,} tokens)")
+
+        # Fraga om databok
+        if successful:
+            print("\nVill du skapa en databok?")
+            print("   1) Ja, fullstandig databok (alla perioder)")
+            print("   2) Nej")
+            databok_choice = input("> ").strip()
+
+            if databok_choice == "1":
+                all_periods_updated = load_all_periods(company["id"])
+                periods_sorted = sorted(
+                    all_periods_updated,
+                    key=lambda x: (
+                        int(re.search(r'(\d{4})', x.get("metadata", {}).get("period", "0")).group(1)) if re.search(r'(\d{4})', x.get("metadata", {}).get("period", "0")) else 0,
+                        int(re.search(r'Q(\d)', x.get("metadata", {}).get("period", "Q0")).group(1)) if re.search(r'Q(\d)', x.get("metadata", {}).get("period", "Q0")) else 0
+                    )
+                )
+                first_period = periods_sorted[0].get("metadata", {}).get("period", "")
+                last_period = periods_sorted[-1].get("metadata", {}).get("period", "")
+                first_short = re.sub(r'(\d{2})(\d{2})$', r'\2', first_period)
+                last_short = re.sub(r'(\d{2})(\d{2})$', r'\2', last_period)
+                default_output = f"{company_name} {first_short} - {last_short}.xlsx"
+
+                output_input = input(f"\nOutput-fil (Enter for [{default_output}]): ").strip()
+                output_file = output_input if output_input else default_output
+
+                print("\n[~] Skapar databok...")
+                normalize_tokens = build_databook(all_periods_updated, output_file)
+
+                print(f"\n[OK] Databok skapad: {output_file}")
+                print(f"   Innehaller {len(all_periods_updated)} period(er)")
+
+                if normalize_tokens:
+                    norm_cost = calculate_cost(normalize_tokens["input_tokens"], normalize_tokens["output_tokens"])
+                    print(f"\n[$$] Normaliseringskostnad: {norm_cost:.2f} kr")
 
     else:
-        print("❌ Ogiltigt val.")
+        print("[!] Ogiltigt val.")
 
 
 def main():
@@ -613,36 +710,15 @@ Exempel:
         help="Ignorera cache, extrahera allt på nytt"
     )
     parser.add_argument(
-        "--full",
-        action="store_true",
-        help="Full extraktion - extrahera ALL text och alla tabeller (inte bara finansiella)"
-    )
-    parser.add_argument(
         "--period", "-p",
         nargs="+",
         metavar="PERIOD",
         help="Filtrera på specifika perioder (t.ex. 'Q1 2025' 'Q2 2025')"
     )
     parser.add_argument(
-        "--streaming",
-        action="store_true",
-        help="Använd streaming API (långsammare men visar progress)"
-    )
-    parser.add_argument(
-        "--model",
-        choices=["sonnet", "haiku"],
-        default="sonnet",
-        help="Vilken Claude-modell att använda (default: sonnet)"
-    )
-    parser.add_argument(
         "--interactive", "-i",
         action="store_true",
         help="Interaktivt läge - guidat flöde för att skapa databöcker"
-    )
-    parser.add_argument(
-        "--multi-pass",
-        action="store_true",
-        help="Använd multi-pass pipeline (Haiku + Sonnet + Haiku)"
     )
 
     args = parser.parse_args()
@@ -698,7 +774,8 @@ Exempel:
             sys.exit(1)
 
         print(f"📊 Laddar data för {args.company} från Supabase...")
-        data = load_cached_extractions(args.company)
+        company = get_or_create_company(args.company)
+        data = load_all_periods(company["id"])
 
         if not data:
             print(f"❌ Ingen data hittades för {args.company}")
@@ -746,34 +823,20 @@ Exempel:
         print(f"📊 Lägger till {len(add_paths)} rapport(er) för {args.company}...\n")
 
         # Ladda befintlig data från Supabase
-        existing = load_cached_extractions(args.company)
+        company = get_or_create_company(args.company)
+        existing = load_all_periods(company["id"])
         print(f"📁 Befintliga perioder: {len(existing)}")
 
         # Extrahera nya PDFs
         on_progress, state = create_progress_tracker(add_paths)
-        if args.multi_pass:
-            print("🔄 Multi-pass pipeline aktiverad")
-            from pipeline import extract_all_pdfs_multi_pass
-            new_results, failed = asyncio.run(
-                extract_all_pdfs_multi_pass(
-                    add_paths,
-                    args.company,
-                    on_progress,
-                    use_cache=not args.no_cache,
-                )
+        new_results, failed = asyncio.run(
+            extract_all_pdfs_multi_pass(
+                add_paths,
+                args.company,
+                on_progress,
+                use_cache=not args.no_cache,
             )
-        else:
-            new_results, failed = asyncio.run(
-                extract_all_pdfs(
-                    add_paths,
-                    args.company,
-                    on_progress,
-                    use_cache=not args.no_cache,
-                    full_extraction=args.full,
-                    use_streaming=args.streaming,
-                    model=args.model
-                )
-            )
+        )
         print()  # Ny rad efter progress
 
         if failed:
@@ -781,8 +844,8 @@ Exempel:
             for path, error in failed:
                 print(f"   • {Path(path).name}: {error}")
 
-        # Visa pipeline-detaljer för multi-pass
-        if args.multi_pass and new_results:
+        # Visa pipeline-detaljer
+        if new_results:
             print_pipeline_details(new_results)
 
         # Kombinera och bygg Excel
@@ -836,34 +899,16 @@ Exempel:
     # Progress tracker
     on_progress, state = create_progress_tracker(pdf_path_strs)
 
-    # Kör extraktion
-    if args.multi_pass:
-        print("🔄 Multi-pass pipeline aktiverad (Haiku → Sonnet → Haiku)")
-        from pipeline import extract_all_pdfs_multi_pass
-        successful, failed = asyncio.run(
-            extract_all_pdfs_multi_pass(
-                pdf_path_strs,
-                args.company,
-                on_progress,
-                use_cache=not args.no_cache,
-            )
+    # Kör extraktion (multi-pass är standard)
+    print("🔄 Multi-pass pipeline (Haiku → Sonnet → Haiku)")
+    successful, failed = asyncio.run(
+        extract_all_pdfs_multi_pass(
+            pdf_path_strs,
+            args.company,
+            on_progress,
+            use_cache=not args.no_cache,
         )
-    else:
-        if args.full:
-            print("🔍 Full extraktion aktiverad - extraherar ALL text och alla tabeller")
-        if args.model == "haiku":
-            print("🤖 Använder Haiku-modellen (billigare men mindre kapabel)")
-        successful, failed = asyncio.run(
-            extract_all_pdfs(
-                pdf_path_strs,
-                args.company,
-                on_progress,
-                use_cache=not args.no_cache,
-                full_extraction=args.full,
-                use_streaming=args.streaming,
-                model=args.model
-            )
-        )
+    )
     print("\n")  # Ny rad efter progress bar
 
     # Sammanfattning
@@ -877,18 +922,9 @@ Exempel:
         for path, error in failed:
             print(f"   • {Path(path).name}: {error}")
 
-    # Visa pipeline-detaljer för multi-pass
-    if args.multi_pass and successful:
+    # Visa pipeline-detaljer
+    if successful:
         print_pipeline_details(successful)
-
-    # Kostnadssammanfattning (om inte multi-pass, som redan visar detta)
-    total_tokens = state["total_input_tokens"] + state["total_output_tokens"]
-    if total_tokens > 0 and not args.multi_pass:
-        total_cost = calculate_cost(state["total_input_tokens"], state["total_output_tokens"])
-        print(f"\n💰 Kostnad:")
-        print(f"   Input:  {state['total_input_tokens']:,} tokens")
-        print(f"   Output: {state['total_output_tokens']:,} tokens")
-        print(f"   Totalt: {total_cost:.2f} kr")
 
     # Bygg Excel
     if successful:

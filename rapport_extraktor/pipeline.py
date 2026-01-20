@@ -32,14 +32,21 @@ from supabase_client import (
     period_exists,
     load_period,
 )
+from validation import (
+    validate_tables,
+    get_retry_prompt_for_table,
+    format_validation_report,
+    ValidationResult,
+)
 
 # Modell-IDs
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 SONNET_MODEL = "claude-sonnet-4-5-20250929"
 
 # Konfiguration
-MAX_CONCURRENT = 5
+MAX_CONCURRENT = 10
 MAX_RETRIES = 3
+MAX_VALIDATION_RETRIES = 2  # Max antal retries per tabell vid valideringsfel
 
 # Priser (USD per 1M tokens)
 HAIKU_INPUT_PRICE = 0.80
@@ -58,12 +65,23 @@ class PassResult(TypedDict):
     data: dict
 
 
+class RetryStats(TypedDict):
+    """Statistik for validation retries."""
+    retry_count: int
+    tables_retried: int
+    input_tokens: int
+    output_tokens: int
+    elapsed_seconds: float
+    cost_sek: float
+
+
 class PipelineResult(TypedDict):
     metadata: dict
     tables: list[dict]
     sections: list[dict]
     charts: list[dict]
     pass_info: list[PassResult]
+    retry_stats: RetryStats
     total_cost_sek: float
 
 
@@ -156,7 +174,7 @@ def parse_json_response(text: str) -> dict:
                         pass
 
                 # Ge upp - skriv ut för debugging
-                print(f"\n⚠️  JSON-parsningsfel: {e}")
+                print(f"\n[VARNING] JSON-parsningsfel: {e}")
                 print(f"   Första 500 tecken: {json_str[:500]}...")
                 raise ValueError(f"Ogiltig JSON: {e}")
 
@@ -326,6 +344,210 @@ async def run_pass_2(
         )
 
 
+async def retry_table_extraction(
+    pdf_base64: str,
+    table: dict,
+    errors: list,
+    structure_map: dict,
+    client: AsyncAnthropic,
+    semaphore: asyncio.Semaphore,
+) -> tuple[dict | None, int, int, float]:
+    """
+    Retry extraktion av en specifik tabell med förstärkt prompt.
+
+    Args:
+        pdf_base64: Base64-kodad PDF
+        table: Den felaktiga tabellen
+        errors: Lista med ValidationError för denna tabell
+        structure_map: Strukturkarta från Pass 1
+        client: Anthropic async-klient
+        semaphore: För rate-limiting
+
+    Returns:
+        Tuple av (korrigerad tabell eller None, input_tokens, output_tokens, elapsed_seconds)
+    """
+    start_time = time.perf_counter()
+    retry_prompt = get_retry_prompt_for_table(table, errors)
+
+    # Hämta metadata för nummerformat
+    metadata = structure_map.get("metadata", {})
+    language = metadata.get("sprak", "sv")
+    number_format = metadata.get("number_format", "swedish")
+
+    # Bygg komplett prompt med retry-instruktioner + original format-instruktioner
+    full_prompt = f"""{retry_prompt}
+
+NUMMERFORMAT: {number_format}
+SPRÅK: {language}
+
+Returnera ENDAST den korrigerade tabellen i JSON-format:
+{{
+  "table": {{
+    "id": "{table.get('id', 'unknown')}",
+    "title": "{table.get('title', '')}",
+    "type": "{table.get('type', '')}",
+    "page": {table.get('page', 0)},
+    "columns": {json.dumps(table.get('columns', []))},
+    "rows": [
+      {{"label": "Faktiskt radnamn från PDF", "values": [null, ...], "order": 1}},
+      ...
+    ]
+  }}
+}}
+"""
+
+    async with semaphore:
+        try:
+            full_response_text = ""
+            input_tokens = 0
+            output_tokens = 0
+
+            async with client.messages.stream(
+                model=SONNET_MODEL,
+                max_tokens=8000,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "document",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": pdf_base64
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": full_prompt
+                        }
+                    ]
+                }]
+            ) as stream:
+                async for text in stream.text_stream:
+                    full_response_text += text
+                final_message = await stream.get_final_message()
+                input_tokens = final_message.usage.input_tokens
+                output_tokens = final_message.usage.output_tokens
+
+            elapsed = time.perf_counter() - start_time
+            result = parse_json_response(full_response_text)
+            return result.get("table"), input_tokens, output_tokens, elapsed
+
+        except Exception as e:
+            elapsed = time.perf_counter() - start_time
+            print(f"   [VARNING] Retry misslyckades: {e}")
+            return None, 0, 0, elapsed
+
+
+async def validate_and_retry_tables(
+    pdf_base64: str,
+    tables: list[dict],
+    structure_map: dict,
+    client: AsyncAnthropic,
+    semaphore: asyncio.Semaphore,
+) -> tuple[list[dict], ValidationResult, RetryStats]:
+    """
+    Validera tabeller och retry de som har fel.
+
+    Args:
+        pdf_base64: Base64-kodad PDF
+        tables: Lista med extraherade tabeller
+        structure_map: Strukturkarta från Pass 1
+        client: Anthropic async-klient
+        semaphore: För rate-limiting
+
+    Returns:
+        Tuple av (korrigerade tabeller, slutgiltig ValidationResult, RetryStats)
+    """
+    current_tables = tables.copy()
+
+    # Samla statistik
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_elapsed = 0.0
+    total_retries = 0
+    tables_retried_set: set[str] = set()
+
+    for retry_attempt in range(MAX_VALIDATION_RETRIES):
+        # Validera nuvarande tabeller
+        validation_result = validate_tables(current_tables)
+
+        if validation_result.is_valid:
+            break
+
+        # Hitta tabeller med fel
+        tables_with_errors = validation_result.tables_with_errors
+
+        if not tables_with_errors:
+            break
+
+        print(f"\n   [RETRY] Validering hittade {len(validation_result.errors)} fel, "
+              f"retry {retry_attempt + 1}/{MAX_VALIDATION_RETRIES}...")
+
+        # Gruppera fel per tabell
+        errors_by_table: dict[str, list] = {}
+        for error in validation_result.errors:
+            if error.table_id not in errors_by_table:
+                errors_by_table[error.table_id] = []
+            errors_by_table[error.table_id].append(error)
+
+        # Retry varje tabell med fel
+        for table_id in tables_with_errors:
+            # Hitta tabellen
+            table_index = None
+            table = None
+            for i, t in enumerate(current_tables):
+                if t.get("id") == table_id:
+                    table_index = i
+                    table = t
+                    break
+
+            if table is None:
+                continue
+
+            table_title = table.get("title", "Okand")
+            print(f"      Retry: {table_title}...")
+
+            # Kor retry
+            corrected, in_tok, out_tok, elapsed = await retry_table_extraction(
+                pdf_base64, table, errors_by_table.get(table_id, []),
+                structure_map, client, semaphore
+            )
+
+            # Samla statistik
+            total_input_tokens += in_tok
+            total_output_tokens += out_tok
+            total_elapsed += elapsed
+            total_retries += 1
+            tables_retried_set.add(table_id)
+
+            if corrected:
+                # Ersatt tabellen med korrigerad version
+                current_tables[table_index] = corrected
+                # Berakna kostnad for denna retry
+                retry_cost = (in_tok * SONNET_INPUT_PRICE + out_tok * SONNET_OUTPUT_PRICE) / 1_000_000 * USD_TO_SEK
+                print(f"      [OK] {table_title} korrigerad ({elapsed:.1f}s, {in_tok}+{out_tok} tokens, {retry_cost:.2f} SEK)")
+            else:
+                print(f"      [FEL] {table_title} kunde inte korrigeras")
+
+    # Slutlig validering
+    final_result = validate_tables(current_tables)
+
+    # Berakna total kostnad for retries
+    retry_cost_sek = (total_input_tokens * SONNET_INPUT_PRICE + total_output_tokens * SONNET_OUTPUT_PRICE) / 1_000_000 * USD_TO_SEK
+
+    retry_stats: RetryStats = {
+        "retry_count": total_retries,
+        "tables_retried": len(tables_retried_set),
+        "input_tokens": total_input_tokens,
+        "output_tokens": total_output_tokens,
+        "elapsed_seconds": round(total_elapsed, 2),
+        "cost_sek": round(retry_cost_sek, 4),
+    }
+
+    return current_tables, final_result, retry_stats
+
+
 async def run_pass_3(
     pdf_base64: str,
     structure_map: dict,
@@ -414,9 +636,19 @@ def merge_results(
     pass_3: PassResult
 ) -> PipelineResult:
     """
-    Kombinera resultat från alla tre pass till slutgiltig struktur.
+    Kombinera resultat fran alla tre pass till slutgiltig struktur.
     """
     total_cost = sum(calculate_pass_cost(p) for p in [pass_1, pass_2, pass_3])
+
+    # Tom retry_stats (fylls i separat)
+    empty_retry_stats: RetryStats = {
+        "retry_count": 0,
+        "tables_retried": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "elapsed_seconds": 0.0,
+        "cost_sek": 0.0,
+    }
 
     return PipelineResult(
         metadata=pass_1["data"].get("metadata", {}),
@@ -424,6 +656,7 @@ def merge_results(
         sections=pass_3["data"].get("sections", []),
         charts=pass_2["data"].get("charts", []),
         pass_info=[pass_1, pass_2, pass_3],
+        retry_stats=empty_retry_stats,
         total_cost_sek=total_cost
     )
 
@@ -477,11 +710,17 @@ async def extract_pdf_multi_pass(
     last_error = None
     for attempt in range(MAX_RETRIES):
         try:
+            extraction_start = time.perf_counter()
+
             # === PASS 1: Strukturidentifiering ===
             if progress_callback:
                 progress_callback(pdf_path, "pass_1", None)
 
             pass_1 = await run_pass_1(pdf_base64, client, semaphore)
+            p1_cost = calculate_pass_cost(pass_1)
+            print(f"   Pass 1 (Haiku):  {pass_1['elapsed_seconds']:.1f}s | "
+                  f"{pass_1['input_tokens']:,}+{pass_1['output_tokens']:,} tokens | "
+                  f"{p1_cost:.2f} SEK")
 
             # === PASS 2 & 3: Parallell extraktion ===
             if progress_callback:
@@ -496,8 +735,38 @@ async def extract_pdf_multi_pass(
 
             pass_2, pass_3 = await asyncio.gather(pass_2_task, pass_3_task)
 
+            p2_cost = calculate_pass_cost(pass_2)
+            p3_cost = calculate_pass_cost(pass_3)
+            print(f"   Pass 2 (Sonnet): {pass_2['elapsed_seconds']:.1f}s | "
+                  f"{pass_2['input_tokens']:,}+{pass_2['output_tokens']:,} tokens | "
+                  f"{p2_cost:.2f} SEK")
+            print(f"   Pass 3 (Haiku):  {pass_3['elapsed_seconds']:.1f}s | "
+                  f"{pass_3['input_tokens']:,}+{pass_3['output_tokens']:,} tokens | "
+                  f"{p3_cost:.2f} SEK")
+
+            # === VALIDERING & RETRY ===
+            if progress_callback:
+                progress_callback(pdf_path, "validating", None)
+
+            tables = pass_2["data"].get("tables", [])
+            validated_tables, validation_result, retry_stats = await validate_and_retry_tables(
+                pdf_base64, tables, pass_1["data"], client, semaphore
+            )
+
+            # Uppdatera pass_2 med validerade tabeller
+            pass_2["data"]["tables"] = validated_tables
+
+            # Logga valideringsresultat
+            if not validation_result.is_valid:
+                print(f"\n   [VARNING] {filename}: Kvarvarande valideringsfel efter retry")
+                print(format_validation_report(validation_result))
+
             # Kombinera resultat
             result = merge_results(pass_1, pass_2, pass_3)
+
+            # Berakna totaler inklusive retries
+            total_cost_with_retries = result["total_cost_sek"] + retry_stats["cost_sek"]
+            total_elapsed = time.perf_counter() - extraction_start
 
             # Konvertera till format kompatibelt med excel_builder
             output = {
@@ -518,21 +787,35 @@ async def extract_pdf_multi_pass(
                         }
                         for p in result["pass_info"]
                     ],
-                    "total_cost_sek": round(result["total_cost_sek"], 2)
+                    "retry_stats": retry_stats,
+                    "total_cost_sek": round(total_cost_with_retries, 2),
+                    "total_elapsed_seconds": round(total_elapsed, 2),
+                    "validation": {
+                        "is_valid": validation_result.is_valid,
+                        "error_count": len(validation_result.errors),
+                        "warning_count": len(validation_result.warnings),
+                    }
                 }
             }
 
+            # Skriv ut sammanfattning
+            total_input = sum(p["input_tokens"] for p in result["pass_info"]) + retry_stats["input_tokens"]
+            total_output = sum(p["output_tokens"] for p in result["pass_info"]) + retry_stats["output_tokens"]
+
+            print(f"\n   --- {filename} KLAR ---")
+            print(f"   Tid: {total_elapsed:.1f}s | Tokens: {total_input:,}+{total_output:,} | Kostnad: {total_cost_with_retries:.2f} SEK")
+            if retry_stats["retry_count"] > 0:
+                print(f"   Retries: {retry_stats['retry_count']} ({retry_stats['tables_retried']} tabeller, {retry_stats['cost_sek']:.2f} SEK)")
+            print(f"   Tabeller: {len(result['tables'])} | Sektioner: {len(result['sections'])} | Grafer: {len(result['charts'])}")
+
             # Spara till Supabase
             save_period(company_id, output, pdf_hash, str(pdf_path))
-
-            # Token-info för progress callback
-            total_input = sum(p["input_tokens"] for p in result["pass_info"])
-            total_output = sum(p["output_tokens"] for p in result["pass_info"])
 
             if progress_callback:
                 progress_callback(pdf_path, "done", {
                     "input_tokens": total_input,
                     "output_tokens": total_output,
+                    "cost_sek": total_cost_with_retries,
                 })
 
             return output
@@ -540,7 +823,7 @@ async def extract_pdf_multi_pass(
         except Exception as e:
             last_error = e
             if attempt < MAX_RETRIES - 1:
-                print(f"\n⚠️  Fel vid extraktion av {filename}:")
+                print(f"\n[VARNING] Fel vid extraktion av {filename}:")
                 print(f"   {type(e).__name__}: {e}")
                 print(f"\n   Retry {attempt + 1}/{MAX_RETRIES}?")
 
