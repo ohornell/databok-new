@@ -2,7 +2,11 @@
 
 ## Att göra
 
--
+- [ ] Lägg till sidnummer på all extraherad data
+  - [ ] Uppdatera rapport_extraktor: spara page_number på alla tabeller (inte bara KPIs/charts)
+  - [ ] Uppdatera databasschemat om nödvändigt
+  - [ ] Lägg till `get_page(company, period, page_number)` verktyg i MCP
+  - [ ] Re-extrahera befintliga rapporter för att få sidnummer
 
 ## Idéer
 
@@ -30,6 +34,11 @@
   - Nackdelar: Fler embeddings, mer komplext, kostar mer i Voyage API
 
 ## Kända problem
+
+- Sidnummer saknas på finansiella tabeller (resultat, balans, kassaflöde)
+  - Gör det omöjligt att svara på "Visa sida X" eller "Summera sida Y"
+  - Behöver fixas i rapport_extraktor för att spara page_number på alla tabeller
+  - MCP behöver nytt verktyg: `get_page(company, period, page_number)`
 
 - Claude Desktop visar inte källor från JSON-responsen
 - Claude Desktop visar inte ASCII-visualiseringar
