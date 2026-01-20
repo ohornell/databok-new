@@ -33,6 +33,13 @@
   - Fördelar: Bättre semantisk matchning, kan peka på exakt stycke
   - Nackdelar: Fler embeddings, mer komplext, kostar mer i Voyage API
 
+- Knowledge-assisterad extraktion (opt-in)
+  - Hämta relevant kunskap innan Pass 2 (terminologi, tabellstruktur, valideringsregler)
+  - Flagga: `--knowledge-assist` för att aktivera
+  - Fördelar: Bättre radklassificering, färre fel i nummerkonvertering
+  - Nackdelar: +1 API-anrop per extraktion, lite långsammare
+  - Utvärdera: Mät kvalitetsförbättring vs kostnad/tid innan beslut
+
 ## Kända problem
 
 - Sidnummer saknas på finansiella tabeller (resultat, balans, kassaflöde)
