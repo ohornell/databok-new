@@ -30,16 +30,39 @@ RETURNERA ENDAST JSON:
 }
 
 ==============================================================================
-SPRÅK OCH NUMMERFORMAT
+SPRÅK OCH NUMMERFORMAT - KRITISKT!
 ==============================================================================
 
-SVENSKT: sprak: "sv", number_format: "swedish"
-- Termer: Nettoomsättning, Rörelseresultat
-- Tal: 1 234,56
+DETEKTERA SPRÅK BASERAT PÅ DOKUMENTETS TEXT, INTE VALUTA ELLER BOLAGSNAMN!
 
-ENGELSKT: sprak: "en", number_format: "english"
-- Termer: Net sales, Operating profit
-- Tal: 1,234.56
+VIKTIGT: Bolag kan skriva rapporter på annat språk än sitt hemland.
+- Svenskt bolag kan skriva på engelska
+- Norskt bolag kan skriva på engelska
+- SEK/MSEK/NOK/MNOK är VALUTA, inte språkindikator!
+Kolla den faktiska texten i dokumentet!
+
+ENGELSKA INDIKATORER (sprak: "en", number_format: "english"):
+- "Interim Report", "Quarterly Report", "Annual Report"
+- "Revenue", "Net sales", "Operating profit", "Gross profit"
+- "Total assets", "Total equity", "Cash flow"
+- "The Group", "Shareholders", "Board of Directors"
+- Månader: January, February, March, April, May, June...
+
+SVENSKA INDIKATORER (sprak: "sv", number_format: "swedish"):
+- "Kvartalsrapport", "Delårsrapport", "Årsredovisning"
+- "Nettoomsättning", "Rörelseresultat", "Bruttoresultat"
+- "Koncernen", "Aktieägare", "Styrelsen"
+- Månader: januari, februari, mars, april, maj, juni...
+
+NORSKA INDIKATORER (sprak: "no", number_format: "swedish"):
+- "Kvartalsrapport", "Delårsrapport", "Årsregnskap"
+- "Driftsinntekter", "Driftsresultat", "Konsernet"
+- "Aksjonærer", "Styret", "Eiendeler", "Gjeld"
+- Månader: januar, februar, mars, april, mai, juni...
+
+NUMMERFORMAT:
+- swedish: 1 234,56 (mellanslag + komma) - används för sv och no
+- english: 1,234.56 (komma + punkt) - används för en
 
 ==============================================================================
 TABELLER - MISSA INGA!
@@ -162,7 +185,8 @@ NUMERISK PARSING - KRITISKT!
 
 ALLA VÄRDEN SKA VARA JSON-TAL (punkt som decimal).
 
-SVENSKT FORMAT (number_format: "swedish"):
+SVENSKT/NORSKT FORMAT (number_format: "swedish"):
+Används för språk: sv, no
 | PDF visar | JSON output |
 |-----------|-------------|
 | 35,1 | 35.1 |
@@ -173,6 +197,7 @@ SVENSKT FORMAT (number_format: "swedish"):
 | (373) | -373 |
 
 ENGELSKT FORMAT (number_format: "english"):
+Används för språk: en
 | PDF visar | JSON output |
 |-----------|-------------|
 | 35.1 | 35.1 |
@@ -184,6 +209,11 @@ ENGELSKT FORMAT (number_format: "english"):
 REGEL FÖR KOMMA I ENGELSKT FORMAT:
 - "1,225" (exakt 3 siffror efter komma) = tusentalsavgränsare → 1225
 - "1,22" (1-2 siffror efter komma) = decimal → 1.22
+
+REGEL FÖR SPRÅK → NUMMERFORMAT:
+- sv (svenska) → swedish
+- no (norska) → swedish (SAMMA som svenska!)
+- en (engelska) → english
 
 TOMMA VÄRDEN → null:
 - "–" (em-dash), "—" (lång em-dash), "-" (ensamt bindestreck)
@@ -265,24 +295,58 @@ Om cell har fotnot (t.ex. "139*" eller "139¹"):
 ]
 
 ==============================================================================
-ENGELSKA TERMER (label_en)
+ENGELSKA TERMER (label_en) - KRITISKT FÖR CROSS-LANGUAGE JÄMFÖRELSE
 ==============================================================================
 
-Lägg till label_en för vanliga termer:
+Lägg till label_en för ALLA vanliga finansiella termer.
+Detta möjliggör jämförelse mellan bolag på olika språk.
 
+SVENSKA → ENGELSKA:
 | Svenska | label_en |
 |---------|----------|
 | Nettoomsättning | Net sales |
 | Kostnad för sålda varor | Cost of goods sold |
 | Bruttoresultat | Gross profit |
+| Försäljningskostnader | Selling expenses |
+| Administrationskostnader | Administrative expenses |
 | Rörelseresultat | Operating profit |
+| Finansiella intäkter | Financial income |
+| Finansiella kostnader | Financial expenses |
 | Finansnetto | Net financial items |
 | Resultat före skatt | Profit before tax |
+| Skatt | Tax |
 | Nettoresultat | Net profit |
+| Periodens resultat | Profit for the period |
 | Summa tillgångar | Total assets |
 | Summa eget kapital | Total equity |
+| Summa skulder | Total liabilities |
+| Kassaflöde från rörelsen | Cash flow from operations |
 
-Utelämna label_en om du är osäker.
+NORSKA → ENGELSKA:
+| Norska | label_en |
+|--------|----------|
+| Driftsinntekter | Net sales |
+| Salgsinntekter | Net sales |
+| Varekostnad | Cost of goods sold |
+| Bruttoresultat | Gross profit |
+| Lønnskostnader | Personnel expenses |
+| Andre driftskostnader | Other operating expenses |
+| Driftsresultat | Operating profit |
+| Finansinntekter | Financial income |
+| Finanskostnader | Financial expenses |
+| Resultat før skatt | Profit before tax |
+| Skattekostnad | Tax |
+| Årsresultat | Net profit |
+| Periodens resultat | Profit for the period |
+| Sum eiendeler | Total assets |
+| Sum egenkapital | Total equity |
+| Sum gjeld | Total liabilities |
+| Kontantstrøm fra drift | Cash flow from operations |
+
+ENGELSKA (behåll label_en = label):
+Om dokumentet är på engelska, sätt label_en = samma som label.
+
+Utelämna label_en ENDAST om du är osäker på korrekt översättning.
 
 ==============================================================================
 GRAFER

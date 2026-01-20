@@ -84,14 +84,14 @@ def main():
                 }).eq("id", section["id"]).execute()
                 total_processed += 1
 
-            print(f"  ✓ {len(batch)} sections uppdaterade")
+            print(f"  [OK] {len(batch)} sections uppdaterade")
 
             # Paus mellan batchar för att undvika rate limit
             if i + batch_size < len(sections):
                 time.sleep(1)
 
         except Exception as e:
-            print(f"  ✗ Fel vid batch {i // batch_size + 1}: {e}")
+            print(f"  [FEL] Fel vid batch {i // batch_size + 1}: {e}")
             raise
 
     print(f"\nKlart! {total_processed} sections har fått embeddings.")

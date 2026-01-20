@@ -6,8 +6,10 @@ Hanterar bolag, perioder och finansiell data.
 import hashlib
 import os
 import re
+import time
 from pathlib import Path
 
+import requests
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
@@ -16,6 +18,10 @@ load_dotenv()
 
 # Supabase-klient (lazy initialization)
 _client: Client | None = None
+
+# Voyage API för embeddings
+VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY", "pa-S5CQuQswu6Vhm3uf3L1TFBCmjP36RLaTkpxpzb4gfCZ")
+VOYAGE_MODEL = "voyage-3"
 
 
 def get_client() -> Client:
@@ -204,14 +210,28 @@ def save_period(company_id: str, data: dict, pdf_hash: str | None = None, source
         client.table("report_tables").delete().eq("period_id", existing["id"]).execute()
         client.table("periods").delete().eq("id", existing["id"]).execute()
 
-    # Skapa period
+    # Hämta pipeline-info om den finns
+    pipeline_info = data.get("_pipeline_info")
+    extraction_meta = None
+    if pipeline_info:
+        extraction_meta = {
+            "retry_stats": pipeline_info.get("retry_stats"),
+            "validation": pipeline_info.get("validation"),
+            "total_cost_sek": pipeline_info.get("total_cost_sek"),
+            "total_elapsed_seconds": pipeline_info.get("total_elapsed_seconds"),
+            "passes": pipeline_info.get("passes")
+        }
+
+    # Skapa period (inkluderar språk för multi-language stöd)
     period_result = client.table("periods").insert({
         "company_id": company_id,
         "quarter": quarter,
         "year": year,
         "valuta": metadata.get("valuta"),
+        "language": metadata.get("sprak", "sv"),  # sv, no, eller en
         "pdf_hash": pdf_hash,
-        "source_file": source_file
+        "source_file": source_file,
+        "extraction_meta": extraction_meta
     }).execute()
 
     period_id = period_result.data[0]["id"]
@@ -236,8 +256,9 @@ def save_period(company_id: str, data: dict, pdf_hash: str | None = None, source
 
     # Spara sektioner (full extraktion)
     sections = data.get("sections", [])
+    section_ids = []
     if sections:
-        save_sections(period_id, sections)
+        section_ids = save_sections(period_id, sections)
 
     # Spara tabeller (full extraktion)
     tables = data.get("tables", [])
@@ -251,6 +272,16 @@ def save_period(company_id: str, data: dict, pdf_hash: str | None = None, source
             save_charts(period_id, charts)
         except Exception:
             pass  # charts-tabellen finns inte ännu
+
+    # Generera embeddings för sections automatiskt
+    if section_ids:
+        try:
+            num_embeddings = generate_embeddings_for_sections(section_ids)
+            if num_embeddings > 0:
+                print(f"   [EMBEDDING] {num_embeddings} sections har fatt embeddings")
+        except Exception as e:
+            print(f"   [EMBEDDING] Kunde inte generera embeddings: {e}")
+            # Fortsätt ändå - embeddings kan genereras senare
 
     return period_id
 
@@ -277,7 +308,8 @@ def load_period(company_id: str, quarter: int, year: int) -> dict | None:
         "metadata": {
             "bolag": company_name,
             "period": f"Q{period['quarter']} {period['year']}",
-            "valuta": period.get("valuta", "TSEK")
+            "valuta": period.get("valuta", "TSEK"),
+            "sprak": period.get("language", "sv")  # sv, no, eller en
         },
         "_source_file": period.get("source_file", "")
     }
@@ -378,13 +410,16 @@ def load_all_periods(company_id: str) -> list[dict]:
 
 # === SECTIONS OCH TABLES (FULL EXTRAKTION) ===
 
-def save_sections(period_id: str, sections: list[dict]) -> None:
+def save_sections(period_id: str, sections: list[dict]) -> list[str]:
     """
     Spara textsektioner till Supabase.
 
     Args:
         period_id: Period-UUID
         sections: Lista med sektioner från full extraktion
+
+    Returns:
+        Lista med section UUIDs som skapades
     """
     client = get_client()
 
@@ -396,11 +431,14 @@ def save_sections(period_id: str, sections: list[dict]) -> None:
             "page_number": section.get("page"),
             "section_type": section.get("type"),
             "content": section.get("content", ""),
-            # embedding sätts separat via generate_embedding()
+            # embedding sätts automatiskt efteråt
         })
 
     if rows:
-        client.table("sections").insert(rows).execute()
+        result = client.table("sections").insert(rows).execute()
+        return [r["id"] for r in result.data]
+
+    return []
 
 
 def save_tables(period_id: str, tables: list[dict]) -> None:
@@ -490,3 +528,107 @@ def parse_period_string(period_str: str) -> tuple[int, int] | None:
     if match:
         return int(match.group(1)), int(match.group(2))
     return None
+
+
+# === EMBEDDINGS ===
+
+def get_voyage_embeddings(texts: list[str], max_retries: int = 5) -> list[list[float]]:
+    """
+    Hämta embeddings från Voyage AI API med retry-logik.
+
+    Args:
+        texts: Lista med texter att generera embeddings för
+        max_retries: Max antal retry vid rate limiting
+
+    Returns:
+        Lista med embedding-vektorer (1024 dimensioner)
+    """
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(
+                "https://api.voyageai.com/v1/embeddings",
+                headers={
+                    "Authorization": f"Bearer {VOYAGE_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": VOYAGE_MODEL,
+                    "input": texts,
+                    "input_type": "document"
+                },
+                timeout=30
+            )
+
+            if response.status_code == 429:
+                wait_time = 2 ** attempt * 5  # 5, 10, 20, 40, 80 sekunder
+                print(f"    [EMBEDDING] Rate limited, vantar {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+
+            response.raise_for_status()
+            data = response.json()
+            return [item["embedding"] for item in data["data"]]
+
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                print(f"    [EMBEDDING] Fel: {e}, retry om {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                raise
+
+    raise Exception("Max retries exceeded for embeddings")
+
+
+def generate_embeddings_for_sections(section_ids: list[str]) -> int:
+    """
+    Generera embeddings för specifika sections.
+
+    Args:
+        section_ids: Lista med section UUIDs
+
+    Returns:
+        Antal uppdaterade sections
+    """
+    if not section_ids:
+        return 0
+
+    client = get_client()
+
+    # Hämta sections
+    result = client.table("sections").select("id, title, content").in_("id", section_ids).execute()
+    sections = result.data
+
+    if not sections:
+        return 0
+
+    # Processa i batchar om 10
+    batch_size = 10
+    total_processed = 0
+
+    for i in range(0, len(sections), batch_size):
+        batch = sections[i:i + batch_size]
+
+        # Kombinera title + content för bättre embedding
+        texts = [f"{s['title']}\n\n{s['content']}" for s in batch]
+
+        try:
+            embeddings = get_voyage_embeddings(texts)
+
+            # Uppdatera varje section med sin embedding
+            for section, embedding in zip(batch, embeddings):
+                client.table("sections").update({
+                    "embedding": embedding
+                }).eq("id", section["id"]).execute()
+                total_processed += 1
+
+            # Paus mellan batchar för att undvika rate limit
+            if i + batch_size < len(sections):
+                time.sleep(1)
+
+        except Exception as e:
+            print(f"    [EMBEDDING] Fel vid batch: {e}")
+            # Fortsätt med nästa batch istället för att avbryta
+            continue
+
+    return total_processed

@@ -2,7 +2,10 @@
 """
 Automatisk namngivning av PDF-rapporter (gratis, utan AI).
 
-Extraherar bolagsnamn och period från PDF:ens första sida med pypdf.
+Extraherar bolagsnamn, period och språk från PDF:ens första sida med pypdf.
+
+Namnformat: {bolag}-{år}-q{kvartal}-{språk}.pdf
+Exempel: vitrolife-2024-q3-sv.pdf, abg-sundal-collier-2025-q3-en.pdf
 
 Användning:
     python rename_pdf.py rapport.pdf              # Enskild fil
@@ -32,53 +35,170 @@ except ImportError:
     pass
 
 
-# Vanliga bolagsnamn att leta efter (lägg till fler vid behov)
-# Längre namn först för att matcha "Vitrolife Group" innan "Vitrolife"
-KNOWN_COMPANIES = [
-    "Vitrolife Group", "Vitrolife", "Freemelt", "Addlife", "Biotage", "Sectra",
-    "Getinge", "Elekta", "Ericsson", "Volvo", "Scania",
-    "Atlas Copco", "Sandvik", "SKF", "Hexagon", "Alfa Laval",
+# Språkspecifika termer för identifiering
+SWEDISH_INDICATORS = [
+    'delårsrapport', 'kvartalsrapport', 'bokslutskommuniké', 'årsredovisning',
+    'nettoomsättning', 'rörelseresultat', 'rörelsemarginal', 'koncernen',
+    'januari', 'februari', 'mars', 'april', 'maj', 'juni',
+    'juli', 'augusti', 'september', 'oktober', 'november', 'december',
+    'kvartal', 'halvår', 'helår', 'msek', 'tsek', 'mkr', 'tkr',
+    'aktieägare', 'styrelsen', 'verkställande direktör',
 ]
 
+NORWEGIAN_INDICATORS = [
+    'kvartalsrapport', 'delårsrapport', 'årsrapport', 'årsregnskap',
+    'driftsinntekter', 'driftsresultat', 'driftsmargin', 'konsernet',
+    'januar', 'februar', 'mars', 'april', 'mai', 'juni',
+    'juli', 'august', 'september', 'oktober', 'november', 'desember',
+    'kvartal', 'halvår', 'helår',
+    # OBS: mnok/nok räknas INTE - det är valuta, inte språk!
+    'aksjonærer', 'styret', 'administrerende direktør',
+    'egenkapital', 'gjeld', 'eiendeler',
+]
 
-def extract_text_from_first_page(pdf_path: str) -> str:
-    """Extrahera text från PDF:ens första sida."""
+ENGLISH_INDICATORS = [
+    'interim report', 'quarterly report', 'annual report', 'year-end report',
+    'net sales', 'operating profit', 'operating margin', 'the group',
+    'january', 'february', 'march', 'april', 'may', 'june',
+    'july', 'august', 'september', 'october', 'november', 'december',
+    'quarter', 'half-year', 'full-year', 'meur', 'musd', 'mgbp',
+    'shareholders', 'board of directors', 'chief executive officer',
+    'equity', 'liabilities', 'assets', 'revenue', 'earnings',
+]
+
+# Ord som INTE är bolagsnamn (filtrera bort)
+EXCLUDED_WORDS = {
+    # Svenska
+    'januari', 'februari', 'mars', 'april', 'maj', 'juni',
+    'juli', 'augusti', 'september', 'oktober', 'november', 'december',
+    'kvartal', 'quarter', 'rapport', 'report', 'delårsrapport', 'kvartalsrapport',
+    'bokslutskommuniké', 'årsredovisning', 'halvårsrapport',
+    'koncernen', 'koncernens', 'moderbolaget', 'styrelsen',
+    # Norska
+    'januar', 'februar', 'mai', 'august', 'desember',
+    'konsernet', 'konsernets', 'morselskapet', 'styret',
+    'årsrapport', 'årsregnskap',
+    # Engelska
+    'january', 'february', 'march', 'may', 'june', 'july', 'august',
+    'september', 'october', 'november', 'december',
+    'interim', 'quarterly', 'annual', 'financial', 'consolidated',
+    'group', 'company', 'corporation', 'limited', 'holdings',
+    'the', 'for', 'and', 'year', 'half',
+}
+
+
+def extract_text_from_first_pages(pdf_path: str, num_pages: int = 2) -> str:
+    """Extrahera text från PDF:ens första sidor."""
     try:
         reader = PdfReader(pdf_path)
-        if len(reader.pages) > 0:
-            return reader.pages[0].extract_text() or ""
+        text_parts = []
+        for i in range(min(num_pages, len(reader.pages))):
+            page_text = reader.pages[i].extract_text() or ""
+            text_parts.append(page_text)
+        return "\n".join(text_parts)
     except Exception as e:
         print(f"[!] Kunde inte läsa PDF: {e}")
     return ""
 
 
-def find_company_name(text: str, filename: str) -> str | None:
-    """Hitta bolagsnamn i text eller filnamn."""
+def detect_language(text: str) -> str:
+    """Detektera språk baserat på nyckelord. Returnerar 'sv', 'no', eller 'en'."""
     text_lower = text.lower()
-    filename_lower = filename.lower()
 
-    # Kolla kända bolag först
-    for company in KNOWN_COMPANIES:
-        if company.lower() in text_lower or company.lower() in filename_lower:
-            return company
+    # Räkna träffar för varje språk
+    sv_count = sum(1 for word in SWEDISH_INDICATORS if word in text_lower)
+    no_count = sum(1 for word in NORWEGIAN_INDICATORS if word in text_lower)
+    en_count = sum(1 for word in ENGLISH_INDICATORS if word in text_lower)
 
-    # Försök hitta från "Delårsrapport [Bolag]" eller liknande
-    patterns = [
-        r'(?:delårsrapport|kvartalsrapport|interim report)\s+([A-ZÅÄÖ][a-zåäö]+(?:\s+[A-ZÅÄÖ][a-zåäö]+)?)',
-        r'^([A-ZÅÄÖ][a-zåäö]+(?:\s+[A-ZÅÄÖ][a-zåäö]+)?)\s+(?:AB|Group|Inc)?',
+    # Engelska-specifika ord som är starka indikatorer
+    english_strong = ['interim report', 'quarterly report', 'annual report',
+                      'revenue', 'earnings', 'shareholders', 'board of directors',
+                      'net sales', 'operating profit', 'the group', 'diluted eps']
+    en_strong = sum(1 for word in english_strong if word in text_lower)
+
+    # Om starka engelska indikatorer finns, prioritera engelska
+    if en_strong >= 2:
+        return 'en'
+
+    # Om engelska har fler träffar än skandinaviska
+    if en_count > max(sv_count, no_count):
+        return 'en'
+
+    # Norska och svenska är lika - kolla specifika skillnader
+    if no_count > 0 or sv_count > 0:
+        # Norska-specifika ord som inte finns på svenska (exkl. valuta)
+        norwegian_unique = ['aksjonærer', 'styret', 'eiendeler', 'gjeld',
+                           'konsernet', 'driftsinntekter', 'januar', 'februar', 'mai',
+                           'august', 'desember', 'administrerende']
+        swedish_unique = ['aktieägare', 'styrelsen', 'tillgångar', 'skulder', 'msek', 'tsek',
+                         'koncernen', 'nettoomsättning', 'januari', 'februari', 'maj',
+                         'augusti', 'december', 'verkställande']
+
+        no_unique = sum(1 for word in norwegian_unique if word in text_lower)
+        sv_unique = sum(1 for word in swedish_unique if word in text_lower)
+
+        if no_unique > sv_unique:
+            return 'no'
+        elif sv_unique > no_unique:
+            return 'sv'
+        # Om lika, kolla generella räknare
+        if no_count > sv_count:
+            return 'no'
+        elif sv_count >= no_count and sv_count > 0:
+            return 'sv'
+
+    # Default till svenska om inget tydligt
+    return 'sv'
+
+
+def find_company_name(text: str, filename: str) -> str | None:
+    """Hitta bolagsnamn dynamiskt från text eller filnamn."""
+    # Strategi 1: Hitta från filnamnet (ofta mest pålitligt)
+    # Mönster: "BOLAG-2024-Q3" eller "Bolag_Q3_2024" etc.
+    filename_patterns = [
+        r'^([A-Za-zÅÄÖåäöØøÆæ][A-Za-zÅÄÖåäöØøÆæ0-9\s\-]+?)[-_\s]*\d{4}[-_\s]*[qQ]\d',
+        r'^([A-Za-zÅÄÖåäöØøÆæ][A-Za-zÅÄÖåäöØøÆæ0-9\s\-]+?)[-_\s]*[qQ]\d[-_\s]*\d{4}',
+        r'^([A-Za-zÅÄÖåäöØøÆæ][A-Za-zÅÄÖåäöØøÆæ\-\s]+?)[-_\s]+(?:interim|report|rapport)',
     ]
 
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+    for pattern in filename_patterns:
+        match = re.match(pattern, filename, re.IGNORECASE)
+        if match:
+            name = match.group(1).strip(' -_')
+            if len(name) >= 2 and name.lower() not in EXCLUDED_WORDS:
+                return clean_company_name(name)
+
+    # Strategi 2: Hitta från dokumenttext
+    text_patterns = [
+        # "Delårsrapport Bolagsnamn" eller "Interim Report Company Name"
+        r'(?:delårsrapport|kvartalsrapport|interim report|quarterly report|årsrapport|annual report)\s+(?:för\s+)?([A-ZÅÄÖØÆ][A-Za-zÅÄÖåäöØøÆæ\s\-]+?)(?:\s+AB|\s+ASA|\s+Group|\s+AS|\s*[,\.]|\s+\d|\s+Q\d|\s+januari|\s+februar|\s+january|\n)',
+        # Första raden med stort bolagsnamn
+        r'^([A-ZÅÄÖØÆ][A-ZÅÄÖØÆ\s\-]{2,30}?)(?:\s+AB|\s+ASA|\s+AS|\s+Group)?\s*$',
+        # "Bolagsnamn AB" eller "Company ASA" på egen rad
+        r'\n([A-ZÅÄÖØÆ][A-Za-zÅÄÖåäöØøÆæ\s\-]+?)\s+(?:AB|ASA|AS|Group|Inc|Ltd|Holding)\s*[\n,\.]',
+    ]
+
+    for pattern in text_patterns:
+        match = re.search(pattern, text, re.MULTILINE | re.IGNORECASE)
         if match:
             name = match.group(1).strip()
-            # Filtrera bort vanliga ord som inte är bolagsnamn
-            if name.lower() not in ['januari', 'februari', 'mars', 'april', 'maj', 'juni',
-                                     'juli', 'augusti', 'september', 'oktober', 'november', 'december',
-                                     'kvartal', 'quarter', 'rapport', 'report']:
-                return name
+            # Ta bort trailing "AB", "ASA" etc om det kom med
+            name = re.sub(r'\s+(AB|ASA|AS|Group|Inc|Ltd|Holding)\s*$', '', name, flags=re.IGNORECASE)
+            if len(name) >= 2 and name.lower() not in EXCLUDED_WORDS:
+                return clean_company_name(name)
 
     return None
+
+
+def clean_company_name(name: str) -> str:
+    """Rensa och normalisera bolagsnamn."""
+    # Ta bort suffix
+    name = re.sub(r'\s+(AB|ASA|AS|Group|Inc|Ltd|Holding|Corporation|Corp)\s*$', '', name, flags=re.IGNORECASE)
+    # Ta bort extra whitespace
+    name = ' '.join(name.split())
+    # Kapitalisera korrekt
+    name = name.strip(' -_')
+    return name
 
 
 def find_period(text: str, filename: str) -> tuple[int, int] | None:
@@ -130,28 +250,33 @@ def find_period(text: str, filename: str) -> tuple[int, int] | None:
     return None
 
 
-def generate_filename(company: str, quarter: int, year: int) -> str:
-    """Generera standardiserat filnamn (år-kvartal för kronologisk sortering)."""
+def generate_filename(company: str, quarter: int, year: int, language: str = 'sv') -> str:
+    """Generera standardiserat filnamn med språksuffix.
+
+    Format: {bolag}-{år}-q{kvartal}-{språk}.pdf
+    Exempel: vitrolife-2024-q3-sv.pdf, abg-sundal-collier-2025-q3-en.pdf
+    """
     company_slug = company.lower()
     company_slug = re.sub(r'[^\w\s-]', '', company_slug)
     company_slug = re.sub(r'[\s_]+', '-', company_slug)
     company_slug = company_slug.strip('-')
-    return f"{company_slug}-{year}-q{quarter}.pdf"
+    return f"{company_slug}-{year}-q{quarter}-{language}.pdf"
 
 
 def analyze_pdf(pdf_path: str) -> dict | None:
-    """Analysera PDF och extrahera namninfo."""
+    """Analysera PDF och extrahera namninfo inklusive språk."""
     path = Path(pdf_path)
 
     if not path.exists():
         print(f"[!] Fil hittades inte: {pdf_path}")
         return None
 
-    text = extract_text_from_first_page(pdf_path)
+    text = extract_text_from_first_pages(pdf_path)
     filename = path.stem
 
     company = find_company_name(text, filename)
     period = find_period(text, filename)
+    language = detect_language(text)
 
     if not company:
         print(f"[!] Kunde inte hitta bolagsnamn")
@@ -167,6 +292,7 @@ def analyze_pdf(pdf_path: str) -> dict | None:
         "company": company,
         "quarter": quarter,
         "year": year,
+        "language": language,
     }
 
 
@@ -183,12 +309,15 @@ def rename_pdf(pdf_path: str, dry_run: bool = False) -> tuple[bool, str]:
     company = info["company"]
     quarter = info["quarter"]
     year = info["year"]
+    language = info["language"]
 
-    new_name = generate_filename(company, quarter, year)
+    new_name = generate_filename(company, quarter, year, language)
     new_path = path.parent / new_name
 
+    language_names = {'sv': 'Svenska', 'no': 'Norska', 'en': 'Engelska'}
     print(f"    Bolag:  {company}")
     print(f"    Period: Q{quarter} {year}")
+    print(f"    Språk:  {language_names.get(language, language)}")
     print(f"    Nytt namn: {new_name}")
 
     if new_path.exists() and new_path != path:
@@ -233,8 +362,8 @@ def batch_rename(folder: str, dry_run: bool = False):
     fail_count = 0
 
     for pdf_path in pdf_files:
-        # Hoppa över filer som redan har rätt format
-        if re.match(r'^[\w-]+-\d{4}-q\d\.pdf$', pdf_path.name):
+        # Hoppa över filer som redan har rätt format (med språksuffix)
+        if re.match(r'^[\w-]+-\d{4}-q\d-(sv|no|en)\.pdf$', pdf_path.name):
             print(f"\n[SKIP] {pdf_path.name} (redan korrekt format)")
             skip_count += 1
             continue
@@ -268,8 +397,8 @@ class PdfRenameHandler(FileSystemEventHandler):
         if path.suffix.lower() != '.pdf':
             return
 
-        # Hoppa över redan korrekt namngivna filer
-        if re.match(r'^[\w-]+-\d{4}-q\d\.pdf$', path.name):
+        # Hoppa över redan korrekt namngivna filer (med språksuffix)
+        if re.match(r'^[\w-]+-\d{4}-q\d-(sv|no|en)\.pdf$', path.name):
             return
 
         # Vänta lite så filen hinner skrivas klart

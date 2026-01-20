@@ -226,10 +226,144 @@ Extrahera tabellen "{table_title}" igen med korrekta labels.
     return prompt
 
 
+def get_batched_retry_prompt(tables_with_errors: list[tuple[dict, list[ValidationError]]]) -> str:
+    """
+    Generera en batchad prompt för att korrigera ALLA felaktiga tabeller i ett anrop.
+
+    Args:
+        tables_with_errors: Lista av tuples (tabell, lista med fel)
+
+    Returns:
+        Komplett prompt för alla tabeller
+    """
+    table_prompts = []
+
+    for table, errors in tables_with_errors:
+        table_title = table.get("title", "Okänd tabell")
+        table_page = table.get("page", "?")
+        table_id = table.get("id", "unknown")
+
+        error_descriptions = []
+        for error in errors:
+            if error.error_type == "invalid_label":
+                row_label = ""
+                rows = table.get("rows", [])
+                if error.row_index is not None and error.row_index < len(rows):
+                    row_label = rows[error.row_index].get("label", "")
+                error_descriptions.append(
+                    f"  - Rad {error.row_index}: Label '{row_label}' "
+                    f"ar inte ett riktigt radnamn. Las av den faktiska texten fran PDF:en."
+                )
+            elif error.error_type == "values_length_mismatch":
+                error_descriptions.append(
+                    f"  - Rad {error.row_index}: Antal values matchar inte antal columns."
+                )
+            elif error.error_type == "empty_table":
+                error_descriptions.append(
+                    f"  - Tabellen har inga rader extraherade."
+                )
+
+        table_prompts.append(f"""
+TABELL {len(table_prompts) + 1}: "{table_title}" (sida {table_page}, id: {table_id})
+Problem:
+{chr(10).join(error_descriptions)}
+""")
+
+    prompt = f"""KORRIGERA FLERA TABELLER
+
+Foljande {len(tables_with_errors)} tabeller har valideringsfel som maste atgardas.
+For varje tabell, las av data fran PDF:en och korrigera felen.
+
+{''.join(table_prompts)}
+
+KRITISKA INSTRUKTIONER (galler ALLA tabeller):
+1. Varje rad MASTE ha "label" med den FAKTISKA texten som visas i PDF:en
+2. ALDRIG generiska labels som "1", "2", "label: 1" - det ar FEL
+3. Om raden ar indenterad, satt "indent": 1 (eller 2 for djupare niva)
+4. Antal values MASTE matcha antal columns exakt
+5. Forsta vardet i values MASTE vara null
+
+Returnera ALLA korrigerade tabeller i JSON-format:
+{{
+  "tables": [
+    {{
+      "id": "table_X",
+      "title": "Tabellens titel",
+      "type": "income_statement|balance_sheet|cash_flow|kpi|other",
+      "page": 1,
+      "columns": ["", "Q4 2024", "Q4 2023", ...],
+      "rows": [
+        {{"label": "Faktiskt radnamn fran PDF", "values": [null, 123, 456], "order": 1}},
+        ...
+      ]
+    }},
+    ...
+  ]
+}}
+"""
+    return prompt
+
+
+# === SECTION VALIDERING ===
+
+def validate_section(section: dict, index: int) -> list[ValidationError]:
+    """
+    Validera en enskild section.
+
+    Returnerar lista med varningar (tom om allt ar OK).
+    Ingen retry - bara loggning for manuell granskning.
+    """
+    warnings = []
+    section_id = section.get("id", f"section_{index}")
+    section_title = section.get("title", "")
+    content = section.get("content", "")
+
+    # Validering 1: Tom content
+    if not content or not content.strip():
+        warnings.append(ValidationError(
+            table_id=section_id,
+            table_title=section_title or f"Section {index}",
+            error_type="empty_content",
+            message="Sektionen har inget innehall",
+            severity="warning"
+        ))
+
+    # Validering 2: Saknar titel (viktigt for sok/embeddings)
+    if not section_title or not section_title.strip():
+        warnings.append(ValidationError(
+            table_id=section_id,
+            table_title=f"Section {index}",
+            error_type="missing_title",
+            message="Sektionen saknar titel",
+            severity="warning"
+        ))
+
+    return warnings
+
+
+def validate_sections(sections: list[dict]) -> ValidationResult:
+    """
+    Validera alla sections.
+
+    Returnerar ValidationResult med varningar (inga errors, ingen retry).
+    """
+    all_warnings = []
+
+    for i, section in enumerate(sections):
+        warnings = validate_section(section, i)
+        all_warnings.extend(warnings)
+
+    return ValidationResult(
+        is_valid=True,  # Sections blockerar aldrig - bara varningar
+        errors=[],
+        warnings=all_warnings
+    )
+
+
 # Convenience-funktion för enkel användning
 def validate_extraction_result(data: dict) -> ValidationResult:
     """
-    Validera ett komplett extraktionsresultat.
+    Validera ett komplett extraktionsresultat (tabeller OCH sections).
 
     Args:
         data: Dict med "tables", "sections", etc.
@@ -237,5 +371,20 @@ def validate_extraction_result(data: dict) -> ValidationResult:
     Returns:
         ValidationResult med alla fel och varningar
     """
+    # Validera tabeller
     tables = data.get("tables", [])
-    return validate_tables(tables)
+    table_result = validate_tables(tables)
+
+    # Validera sections
+    sections = data.get("sections", [])
+    section_result = validate_sections(sections)
+
+    # Kombinera resultat
+    combined_errors = table_result.errors + section_result.errors
+    combined_warnings = table_result.warnings + section_result.warnings
+
+    return ValidationResult(
+        is_valid=len(combined_errors) == 0,
+        errors=combined_errors,
+        warnings=combined_warnings
+    )

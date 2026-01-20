@@ -34,7 +34,9 @@ from supabase_client import (
 )
 from validation import (
     validate_tables,
+    validate_sections,
     get_retry_prompt_for_table,
+    get_batched_retry_prompt,
     format_validation_report,
     ValidationResult,
 )
@@ -439,6 +441,96 @@ Returnera ENDAST den korrigerade tabellen i JSON-format:
             return None, 0, 0, elapsed
 
 
+async def batched_retry_table_extraction(
+    pdf_base64: str,
+    tables_with_errors: list[tuple[dict, list]],
+    structure_map: dict,
+    client: AsyncAnthropic,
+    semaphore: asyncio.Semaphore,
+) -> tuple[dict[str, dict], int, int, float]:
+    """
+    Batched retry - extrahera ALLA felaktiga tabeller i ETT API-anrop.
+
+    Args:
+        pdf_base64: Base64-kodad PDF
+        tables_with_errors: Lista av tuples (tabell, lista med fel)
+        structure_map: Strukturkarta fran Pass 1
+        client: Anthropic async-klient
+        semaphore: For rate-limiting
+
+    Returns:
+        Tuple av (dict med tabell_id -> korrigerad tabell, input_tokens, output_tokens, elapsed_seconds)
+    """
+    if not tables_with_errors:
+        return {}, 0, 0, 0.0
+
+    start_time = time.perf_counter()
+
+    # Generera batched prompt for alla tabeller
+    batched_prompt = get_batched_retry_prompt(tables_with_errors)
+
+    # Hamta metadata for nummerformat
+    metadata = structure_map.get("metadata", {})
+    language = metadata.get("sprak", "sv")
+    number_format = metadata.get("number_format", "swedish")
+
+    full_prompt = f"""{batched_prompt}
+
+NUMMERFORMAT: {number_format}
+SPRAK: {language}
+"""
+
+    async with semaphore:
+        try:
+            full_response_text = ""
+            input_tokens = 0
+            output_tokens = 0
+
+            async with client.messages.stream(
+                model=SONNET_MODEL,
+                max_tokens=32000,  # Storre for batched
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "document",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": pdf_base64
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": full_prompt
+                        }
+                    ]
+                }]
+            ) as stream:
+                async for text in stream.text_stream:
+                    full_response_text += text
+                final_message = await stream.get_final_message()
+                input_tokens = final_message.usage.input_tokens
+                output_tokens = final_message.usage.output_tokens
+
+            elapsed = time.perf_counter() - start_time
+            result = parse_json_response(full_response_text)
+
+            # Bygg dict med tabell_id -> korrigerad tabell
+            corrected_tables = {}
+            for table in result.get("tables", []):
+                table_id = table.get("id")
+                if table_id:
+                    corrected_tables[table_id] = table
+
+            return corrected_tables, input_tokens, output_tokens, elapsed
+
+        except Exception as e:
+            elapsed = time.perf_counter() - start_time
+            print(f"   [VARNING] Batched retry misslyckades: {e}")
+            return {}, 0, 0, elapsed
+
+
 async def validate_and_retry_tables(
     pdf_base64: str,
     tables: list[dict],
@@ -476,13 +568,13 @@ async def validate_and_retry_tables(
             break
 
         # Hitta tabeller med fel
-        tables_with_errors = validation_result.tables_with_errors
+        error_table_ids = validation_result.tables_with_errors
 
-        if not tables_with_errors:
+        if not error_table_ids:
             break
 
-        print(f"\n   [RETRY] Validering hittade {len(validation_result.errors)} fel, "
-              f"retry {retry_attempt + 1}/{MAX_VALIDATION_RETRIES}...")
+        print(f"\n   [RETRY] Validering hittade {len(validation_result.errors)} fel i "
+              f"{len(error_table_ids)} tabeller, batched retry {retry_attempt + 1}/{MAX_VALIDATION_RETRIES}...")
 
         # Gruppera fel per tabell
         errors_by_table: dict[str, list] = {}
@@ -491,47 +583,56 @@ async def validate_and_retry_tables(
                 errors_by_table[error.table_id] = []
             errors_by_table[error.table_id].append(error)
 
-        # Retry varje tabell med fel
-        for table_id in tables_with_errors:
-            # Hitta tabellen
-            table_index = None
-            table = None
+        # Bygg lista av (tabell, fel) for batched retry
+        tables_to_retry: list[tuple[dict, list]] = []
+        table_index_map: dict[str, int] = {}  # tabell_id -> index i current_tables
+
+        for table_id in error_table_ids:
             for i, t in enumerate(current_tables):
                 if t.get("id") == table_id:
-                    table_index = i
-                    table = t
+                    tables_to_retry.append((t, errors_by_table.get(table_id, [])))
+                    table_index_map[table_id] = i
+                    tables_retried_set.add(table_id)
+                    print(f"      - {t.get('title', 'Okand')}")
                     break
 
-            if table is None:
-                continue
+        if not tables_to_retry:
+            break
 
-            table_title = table.get("title", "Okand")
-            print(f"      Retry: {table_title}...")
+        # BATCHED RETRY - ett API-anrop for alla tabeller
+        corrected_tables, in_tok, out_tok, elapsed = await batched_retry_table_extraction(
+            pdf_base64, tables_to_retry, structure_map, client, semaphore
+        )
 
-            # Kor retry
-            corrected, in_tok, out_tok, elapsed = await retry_table_extraction(
-                pdf_base64, table, errors_by_table.get(table_id, []),
-                structure_map, client, semaphore
-            )
+        # Samla statistik
+        total_input_tokens += in_tok
+        total_output_tokens += out_tok
+        total_elapsed += elapsed
+        total_retries += 1  # Raknas som 1 retry (batched)
 
-            # Samla statistik
-            total_input_tokens += in_tok
-            total_output_tokens += out_tok
-            total_elapsed += elapsed
-            total_retries += 1
-            tables_retried_set.add(table_id)
+        # Uppdatera tabeller med korrigerade versioner
+        corrected_count = 0
+        for table_id, corrected_table in corrected_tables.items():
+            if table_id in table_index_map:
+                current_tables[table_index_map[table_id]] = corrected_table
+                corrected_count += 1
 
-            if corrected:
-                # Ersatt tabellen med korrigerad version
-                current_tables[table_index] = corrected
-                # Berakna kostnad for denna retry
-                retry_cost = (in_tok * SONNET_INPUT_PRICE + out_tok * SONNET_OUTPUT_PRICE) / 1_000_000 * USD_TO_SEK
-                print(f"      [OK] {table_title} korrigerad ({elapsed:.1f}s, {in_tok}+{out_tok} tokens, {retry_cost:.2f} SEK)")
-            else:
-                print(f"      [FEL] {table_title} kunde inte korrigeras")
+        # Berakna kostnad for denna batch
+        retry_cost = (in_tok * SONNET_INPUT_PRICE + out_tok * SONNET_OUTPUT_PRICE) / 1_000_000 * USD_TO_SEK
+        print(f"      [BATCHED] {corrected_count}/{len(tables_to_retry)} tabeller korrigerade "
+              f"({elapsed:.1f}s, {in_tok}+{out_tok} tokens, {retry_cost:.2f} SEK)")
 
     # Slutlig validering
     final_result = validate_tables(current_tables)
+
+    # Visa slutstatus efter retries
+    if total_retries > 0:
+        if final_result.is_valid:
+            print(f"      [RETRY KLAR] ✓ Alla {len(tables_retried_set)} tabeller validerar nu korrekt")
+        else:
+            remaining_errors = len(final_result.errors)
+            remaining_tables = len(final_result.tables_with_errors)
+            print(f"      [RETRY KLAR] ✗ {remaining_errors} fel kvarstår i {remaining_tables} tabeller")
 
     # Berakna total kostnad for retries
     retry_cost_sek = (total_input_tokens * SONNET_INPUT_PRICE + total_output_tokens * SONNET_OUTPUT_PRICE) / 1_000_000 * USD_TO_SEK
@@ -756,10 +857,25 @@ async def extract_pdf_multi_pass(
             # Uppdatera pass_2 med validerade tabeller
             pass_2["data"]["tables"] = validated_tables
 
-            # Logga valideringsresultat
-            if not validation_result.is_valid:
-                print(f"\n   [VARNING] {filename}: Kvarvarande valideringsfel efter retry")
-                print(format_validation_report(validation_result))
+            # Validera sections (ingen retry, bara varningar)
+            sections = pass_3["data"].get("sections", [])
+            section_validation = validate_sections(sections)
+
+            # Kombinerad valideringsrapport (tabeller + sections)
+            has_issues = (not validation_result.is_valid or validation_result.has_warnings or
+                         section_validation.has_warnings)
+            if has_issues:
+                print(f"\n   [VALIDERING] {filename}:")
+                if not validation_result.is_valid or validation_result.has_warnings:
+                    print(format_validation_report(validation_result))
+                if section_validation.has_warnings:
+                    print(format_validation_report(section_validation))
+            else:
+                # Visa bekräftelse även när allt är OK
+                table_count = len(validated_tables)
+                section_count = len(sections)
+                retry_info = f" ({retry_stats['retries']} retries)" if retry_stats['retries'] > 0 else ""
+                print(f"\n   [VALIDERING] OK - {table_count} tabeller, {section_count} sektioner{retry_info}")
 
             # Kombinera resultat
             result = merge_results(pass_1, pass_2, pass_3)
@@ -791,9 +907,35 @@ async def extract_pdf_multi_pass(
                     "total_cost_sek": round(total_cost_with_retries, 2),
                     "total_elapsed_seconds": round(total_elapsed, 2),
                     "validation": {
-                        "is_valid": validation_result.is_valid,
-                        "error_count": len(validation_result.errors),
-                        "warning_count": len(validation_result.warnings),
+                        "tables": {
+                            "is_valid": validation_result.is_valid,
+                            "error_count": len(validation_result.errors),
+                            "warning_count": len(validation_result.warnings),
+                            "errors": [
+                                {
+                                    "table_id": e.table_id,
+                                    "table_title": e.table_title,
+                                    "error_type": e.error_type,
+                                    "message": e.message,
+                                    "row_index": e.row_index
+                                }
+                                for e in validation_result.errors
+                            ] if validation_result.errors else [],
+                        },
+                        "sections": {
+                            "is_valid": section_validation.is_valid,
+                            "error_count": len(section_validation.errors),
+                            "warning_count": len(section_validation.warnings),
+                            "warnings": [
+                                {
+                                    "section_id": w.table_id,
+                                    "section_title": w.table_title,
+                                    "warning_type": w.error_type,
+                                    "message": w.message
+                                }
+                                for w in section_validation.warnings
+                            ] if section_validation.warnings else [],
+                        }
                     }
                 }
             }

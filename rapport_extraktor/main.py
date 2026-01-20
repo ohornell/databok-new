@@ -108,12 +108,16 @@ def create_progress_tracker(pdf_paths: list[str]):
     """
     Skapa progress-callback för terminal-output med en rad per fil.
     Visar tokens, kostnad och tid för varje fil.
+    Inkluderar bakgrundstimer som uppdaterar UI var 0.5 sekund.
     """
+    import threading
+
     # Behåll ordning med lista av sökvägar
     path_order = [str(p) for p in pdf_paths]
     files = {str(p): {
         "name": Path(p).name,
         "status": "pending",
+        "pass_info": None,  # "pass_1", "pass_2_3", "validating"
         "input": 0,
         "output": 0,
         "cost": 0.0,
@@ -128,6 +132,7 @@ def create_progress_tracker(pdf_paths: list[str]):
         "cached": 0,
         "failed": 0,
         "start_time": time.time(),
+        "running": True,  # För att stoppa bakgrundstimern
     }
 
     def render():
@@ -144,7 +149,15 @@ def create_progress_tracker(pdf_paths: list[str]):
             elif info["status"] == "extracting":
                 icon = "[~]"
                 elapsed = time.time() - info["start_time"] if info["start_time"] else 0
-                details = f"{format_time(elapsed)}"
+                # Visa aktuellt pass om tillgängligt
+                pass_label = ""
+                if info["pass_info"] == "pass_1":
+                    pass_label = "Pass 1/3 (struktur) "
+                elif info["pass_info"] == "pass_2_3":
+                    pass_label = "Pass 2/3 (data) "
+                elif info["pass_info"] == "validating":
+                    pass_label = "Validerar "
+                details = f"{pass_label}{format_time(elapsed)}"
             elif info["status"] == "cached":
                 icon = "[C]"
                 details = "(cachad)"
@@ -194,6 +207,9 @@ def create_progress_tracker(pdf_paths: list[str]):
         elif status == "extracting":
             files[path_key]["status"] = "extracting"
             files[path_key]["start_time"] = time.time()
+        elif status in ("pass_1", "pass_2_3", "validating"):
+            # Uppdatera pass-info utan att ändra status
+            files[path_key]["pass_info"] = status
 
         render()
 
@@ -202,7 +218,23 @@ def create_progress_tracker(pdf_paths: list[str]):
         print()
     render()
 
-    return on_progress, state
+    # Bakgrundstimer för regelbundna uppdateringar
+    def timer_loop():
+        while state["running"]:
+            time.sleep(0.5)
+            if state["running"]:  # Kolla igen efter sleep
+                # Bara rendera om något pågår
+                any_extracting = any(f["status"] == "extracting" for f in files.values())
+                if any_extracting:
+                    render()
+
+    timer_thread = threading.Thread(target=timer_loop, daemon=True)
+    timer_thread.start()
+
+    def stop_timer():
+        state["running"] = False
+
+    return on_progress, state, stop_timer
 
 
 def guess_company_name(pdf_path: str) -> str:
@@ -441,7 +473,7 @@ def run_interactive_mode(pdf_path: str | None = None):
             pdf_size = path.stat().st_size
             use_streaming = pdf_size > 1_000_000
 
-            on_progress, state = create_progress_tracker([str(path)])
+            on_progress, state, stop_timer = create_progress_tracker([str(path)])
 
             successful, failed = asyncio.run(
                 extract_all_pdfs_multi_pass(
@@ -451,6 +483,7 @@ def run_interactive_mode(pdf_path: str | None = None):
                     use_cache=False,
                 )
             )
+            stop_timer()
             print()
 
             if successful:
@@ -567,7 +600,7 @@ def run_interactive_mode(pdf_path: str | None = None):
         # Extraktion
         print("\n[~] Startar batch-extraktion...\n")
 
-        on_progress, state = create_progress_tracker(pdf_path_strs)
+        on_progress, state, stop_timer = create_progress_tracker(pdf_path_strs)
 
         successful, failed = asyncio.run(
             extract_all_pdfs_multi_pass(
@@ -577,6 +610,7 @@ def run_interactive_mode(pdf_path: str | None = None):
                 use_cache=True,
             )
         )
+        stop_timer()
         print()
 
         # Sammanfattning
@@ -828,7 +862,7 @@ Exempel:
         print(f"📁 Befintliga perioder: {len(existing)}")
 
         # Extrahera nya PDFs
-        on_progress, state = create_progress_tracker(add_paths)
+        on_progress, state, stop_timer = create_progress_tracker(add_paths)
         new_results, failed = asyncio.run(
             extract_all_pdfs_multi_pass(
                 add_paths,
@@ -837,6 +871,7 @@ Exempel:
                 use_cache=not args.no_cache,
             )
         )
+        stop_timer()
         print()  # Ny rad efter progress
 
         if failed:
@@ -897,7 +932,7 @@ Exempel:
     print(f"🏢 Bolag: {args.company}")
 
     # Progress tracker
-    on_progress, state = create_progress_tracker(pdf_path_strs)
+    on_progress, state, stop_timer = create_progress_tracker(pdf_path_strs)
 
     # Kör extraktion (multi-pass är standard)
     print("🔄 Multi-pass pipeline (Haiku → Sonnet → Haiku)")
@@ -909,6 +944,7 @@ Exempel:
             use_cache=not args.no_cache,
         )
     )
+    stop_timer()
     print("\n")  # Ny rad efter progress bar
 
     # Sammanfattning

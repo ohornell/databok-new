@@ -130,7 +130,7 @@ def db_get_financials(company_slug: str, period: str | None = None, statement_ty
     company_id = company.data[0]["id"]
     company_name = company.data[0]["name"]
     
-    # Hitta period (inkluderar source_file och pdf_hash direkt)
+    # Hitta period (inkluderar source_file, pdf_hash och language)
     if period:
         # Parsa "Q3 2024"
         import re
@@ -138,14 +138,14 @@ def db_get_financials(company_slug: str, period: str | None = None, statement_ty
         if match:
             quarter, year = int(match.group(1)), int(match.group(2))
             period_row = client.table("periods").select(
-                "id, quarter, year, valuta, source_file, pdf_hash"
+                "id, quarter, year, valuta, language, source_file, pdf_hash"
             ).eq("company_id", company_id).eq("quarter", quarter).eq("year", year).execute()
         else:
             return {"error": f"Ogiltigt periodformat: {period}. Använd t.ex. 'Q3 2024'"}
     else:
         # Senaste period
         period_row = client.table("periods").select(
-            "id, quarter, year, valuta, source_file, pdf_hash"
+            "id, quarter, year, valuta, language, source_file, pdf_hash"
         ).eq("company_id", company_id).order("year", desc=True).order("quarter", desc=True).limit(1).execute()
 
     if not period_row.data:
@@ -155,14 +155,17 @@ def db_get_financials(company_slug: str, period: str | None = None, statement_ty
     period_id = p["id"]
     period_str = f"Q{p['quarter']} {p['year']}"
     valuta = p.get("valuta", "TSEK")
+    language = p.get("language", "sv")
 
     result = {
         "company": company_name,
         "period": period_str,
         "valuta": valuta,
+        "language": language,  # sv, no, eller en
         "source": {
             "file": p.get("source_file"),
-            "pdf_hash": p.get("pdf_hash")
+            "pdf_hash": p.get("pdf_hash"),
+            "language": language
         },
         "tables": {}
     }
@@ -508,18 +511,271 @@ def db_compare_periods(company_slug: str, period1: str, period2: str) -> dict:
     """Jämför två perioder för samma bolag."""
     data1 = db_get_financials(company_slug, period1, "income_statement")
     data2 = db_get_financials(company_slug, period2, "income_statement")
-    
+
     if "error" in data1:
         return data1
     if "error" in data2:
         return data2
-    
+
     return {
         "company": data1["company"],
         "comparison": {
             period1: data1["tables"],
             period2: data2["tables"]
         }
+    }
+
+
+# Synonymer för label_en-matchning (STRIKT - endast definitivt ekvivalenta termer)
+# Fallback om DB inte finns. Bättre att missa matchning än visa felaktig jämförelse.
+LABEL_EN_SYNONYMS = {
+    # ============ RESULTATRÄKNING ============
+    # OBS: "revenue", "sales", "turnover" är INTE synonymer - kan betyda olika saker
+    "net sales": ["net sales", "net revenue"],
+    # Kostnader
+    "cost of goods sold": ["cost of goods sold", "cogs", "cost of sales"],
+    "personnel expenses": ["personnel expenses", "personnel costs", "employee expenses", "staff costs"],
+    "other operating expenses": ["other operating expenses", "other operating costs"],
+    "selling expenses": ["selling expenses"],
+    "administrative expenses": ["administrative expenses", "admin expenses"],
+    # Avskrivningar - OBS: "depreciation" och "amortization" ensamma är OLIKA
+    "depreciation and amortization": ["depreciation and amortization", "d&a"],
+    # Resultat - OBS: "EBIT" separerat från "operating profit" (kan skilja vid exceptionella poster)
+    "gross profit": ["gross profit", "gross income"],
+    "operating profit": ["operating profit", "operating income", "operating result"],
+    "ebit": ["ebit"],
+    "ebitda": ["ebitda"],
+    "profit before tax": ["profit before tax", "earnings before tax", "ebt", "result before tax", "profit after financial items"],
+    "net profit": ["net profit", "net income", "net result", "profit for the period", "net earnings", "result for the period"],
+    # Finansiellt
+    "net financial items": ["net financial items", "net financial result"],
+    "financial income": ["financial income", "finance income"],
+    "financial expenses": ["financial expenses", "finance costs"],
+    # Skatt
+    "tax": ["tax", "income tax", "tax expense"],
+
+    # ============ BALANSRÄKNING - TILLGÅNGAR ============
+    # OBS: "assets" ensamt, "fixed assets" är för vaga
+    "total assets": ["total assets", "sum assets"],
+    "non-current assets": ["non-current assets", "long-term assets"],
+    "current assets": ["current assets", "short-term assets"],
+    "intangible assets": ["intangible assets", "intangibles"],
+    "goodwill": ["goodwill"],
+    "property plant and equipment": ["property plant and equipment", "ppe", "tangible fixed assets"],
+    "inventories": ["inventories", "inventory"],  # OBS: "stock" borttagen (tvetydigt)
+    "trade receivables": ["trade receivables", "accounts receivable"],
+    "cash and cash equivalents": ["cash and cash equivalents", "cash and equivalents", "cash and bank"],
+
+    # ============ BALANSRÄKNING - EGET KAPITAL ============
+    # OBS: "equity" ensamt, "net assets" är för vaga
+    "total equity": ["total equity", "shareholders equity", "stockholders equity"],
+    "share capital": ["share capital", "common stock", "issued capital"],
+    "retained earnings": ["retained earnings", "accumulated profit", "accumulated earnings"],
+
+    # ============ BALANSRÄKNING - SKULDER ============
+    # OBS: "debt", "liabilities" ensamma är för vaga
+    "total liabilities": ["total liabilities", "sum liabilities"],
+    "non-current liabilities": ["non-current liabilities", "long-term liabilities"],
+    "current liabilities": ["current liabilities", "short-term liabilities"],
+    "trade payables": ["trade payables", "accounts payable"],
+    "interest-bearing debt": ["interest-bearing debt", "interest-bearing liabilities", "borrowings"],
+    "provisions": ["provisions"],  # OBS: "accruals" borttagen (annorlunda)
+    "deferred tax liabilities": ["deferred tax liabilities", "deferred tax"],
+
+    # ============ KASSAFLÖDE ============
+    "cash flow from operations": ["cash flow from operations", "operating cash flow", "cash flow from operating activities"],
+    "cash flow from investing": ["cash flow from investing", "cash flow from investing activities"],
+    "cash flow from financing": ["cash flow from financing", "cash flow from financing activities"],
+    "change in cash": ["change in cash", "net change in cash"],
+    "capital expenditure": ["capital expenditure", "capex"],
+    "dividends paid": ["dividends paid", "dividend payments"],
+}
+
+
+# Cache för DB-synonymer (laddas vid första anrop)
+_db_synonyms_cache: dict | None = None
+
+
+def _load_db_synonyms() -> dict:
+    """Ladda synonymer från databasen (cachas)."""
+    global _db_synonyms_cache
+    if _db_synonyms_cache is not None:
+        return _db_synonyms_cache
+
+    try:
+        client = get_client()
+        result = client.table("label_synonyms").select("synonym, canonical").execute()
+        if result.data:
+            _db_synonyms_cache = {row["synonym"]: row["canonical"] for row in result.data}
+            return _db_synonyms_cache
+    except Exception:
+        pass  # Fallback till Python-dict om DB-tabell saknas
+
+    _db_synonyms_cache = {}
+    return _db_synonyms_cache
+
+
+def _normalize_label_en(label: str) -> str:
+    """Normalisera label_en för jämförelse. Använder DB om tillgänglig, annars Python-dict."""
+    label_lower = label.lower().strip()
+
+    # Försök DB-lookup först (skalbart för 1000+ bolag)
+    db_synonyms = _load_db_synonyms()
+    if db_synonyms and label_lower in db_synonyms:
+        return db_synonyms[label_lower]
+
+    # Fallback till Python-dict
+    for canonical, synonyms in LABEL_EN_SYNONYMS.items():
+        if label_lower in synonyms:
+            return canonical
+
+    return label_lower
+
+
+def db_compare_companies(
+    company1_slug: str,
+    company2_slug: str,
+    period1: str | None = None,
+    period2: str | None = None,
+    statement_type: str = "income_statement"
+) -> dict:
+    """
+    Jämför finansiell data mellan två olika bolag.
+    Matchar rader via label_en för cross-language jämförelse.
+
+    Args:
+        company1_slug: Första bolagets slug/namn
+        company2_slug: Andra bolagets slug/namn
+        period1: Period för bolag 1 (default: senaste)
+        period2: Period för bolag 2 (default: senaste)
+        statement_type: Typ av rapport att jämföra
+    """
+    data1 = db_get_financials(company1_slug, period1, statement_type)
+    data2 = db_get_financials(company2_slug, period2, statement_type)
+
+    if "error" in data1:
+        return data1
+    if "error" in data2:
+        return data2
+
+    # Bygg jämförelse med label_en som matchningsnyckel
+    comparison_rows = []
+
+    # Samla alla rader från båda bolagen
+    rows1 = []
+    rows2 = []
+
+    for table_type, tables in data1.get("tables", {}).items():
+        for table in tables:
+            for row in table.get("rows", []):
+                rows1.append({
+                    "label": row.get("label", ""),
+                    "label_en": row.get("label_en", ""),
+                    "normalized_label": _normalize_label_en(row.get("label_en", "")),
+                    "values": row.get("values", []),
+                    "table": table.get("title", "")
+                })
+
+    for table_type, tables in data2.get("tables", {}).items():
+        for table in tables:
+            for row in table.get("rows", []):
+                rows2.append({
+                    "label": row.get("label", ""),
+                    "label_en": row.get("label_en", ""),
+                    "normalized_label": _normalize_label_en(row.get("label_en", "")),
+                    "values": row.get("values", []),
+                    "table": table.get("title", "")
+                })
+
+    # Matcha rader via normaliserad label_en
+    matched = set()
+    unmatched_rows1 = []
+
+    for r1 in rows1:
+        normalized = r1.get("normalized_label", "")
+        if not normalized:
+            continue
+
+        found_match = False
+        for r2 in rows2:
+            r2_normalized = r2.get("normalized_label", "")
+            if normalized == r2_normalized and normalized not in matched:
+                matched.add(normalized)
+                found_match = True
+
+                # Hämta första numeriska värdet (hoppa över null)
+                val1_raw = next((v for v in r1.get("values", []) if v is not None), None)
+                val2_raw = next((v for v in r2.get("values", []) if v is not None), None)
+
+                # Konvertera till nummer om möjligt
+                def to_number(val):
+                    if val is None:
+                        return None
+                    if isinstance(val, (int, float)):
+                        return val
+                    if isinstance(val, str):
+                        try:
+                            # Försök konvertera sträng till tal
+                            cleaned = val.strip().replace(" ", "").replace(",", ".")
+                            return float(cleaned)
+                        except (ValueError, AttributeError):
+                            return None
+                    return None
+
+                val1 = to_number(val1_raw)
+                val2 = to_number(val2_raw)
+
+                # Beräkna difference och ratio endast om båda är numeriska
+                diff = None
+                ratio = None
+                if isinstance(val1, (int, float)) and isinstance(val2, (int, float)):
+                    diff = round(val1 - val2, 2)
+                    if val2 != 0:
+                        ratio = round(val1 / val2, 2)
+
+                comparison_rows.append({
+                    "label_en": r1.get("label_en", ""),
+                    "matched_via": normalized if normalized != r1.get("label_en", "").lower().strip() else None,
+                    "company1": {
+                        "label": r1.get("label", ""),
+                        "value": val1
+                    },
+                    "company2": {
+                        "label": r2.get("label", ""),
+                        "value": val2
+                    },
+                    "difference": diff,
+                    "ratio": ratio
+                })
+                break
+
+        if not found_match and r1.get("label_en"):
+            unmatched_rows1.append(r1.get("label_en", ""))
+
+    # Ta bort None från matched_via i output
+    for row in comparison_rows:
+        if row.get("matched_via") is None:
+            del row["matched_via"]
+
+    return {
+        "comparison_type": "cross_company",
+        "statement_type": statement_type,
+        "company1": {
+            "name": data1.get("company", ""),
+            "period": data1.get("period", ""),
+            "valuta": data1.get("valuta", ""),
+            "language": data1.get("language", "sv")
+        },
+        "company2": {
+            "name": data2.get("company", ""),
+            "period": data2.get("period", ""),
+            "valuta": data2.get("valuta", ""),
+            "language": data2.get("language", "sv")
+        },
+        "matched_rows": comparison_rows,
+        "match_count": len(comparison_rows),
+        "unmatched_from_company1": unmatched_rows1[:10] if unmatched_rows1 else [],
+        "note": "Matchning sker via label_en med synonym-normalisering"
     }
 
 
@@ -759,6 +1015,37 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["company"]
             }
+        ),
+        Tool(
+            name="compare_companies",
+            description="Jämför finansiell data mellan två olika bolag. Fungerar även cross-language (t.ex. svenskt vs norskt bolag) via standardiserade engelska termer (label_en).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "company1": {
+                        "type": "string",
+                        "description": "Första bolagets namn eller slug"
+                    },
+                    "company2": {
+                        "type": "string",
+                        "description": "Andra bolagets namn eller slug"
+                    },
+                    "period1": {
+                        "type": "string",
+                        "description": "Period för bolag 1, t.ex. 'Q3 2024'. Om utelämnad hämtas senaste."
+                    },
+                    "period2": {
+                        "type": "string",
+                        "description": "Period för bolag 2, t.ex. 'Q3 2024'. Om utelämnad hämtas senaste."
+                    },
+                    "statement_type": {
+                        "type": "string",
+                        "enum": ["income_statement", "balance_sheet", "cash_flow"],
+                        "description": "Typ av rapport att jämföra. Default: income_statement"
+                    }
+                },
+                "required": ["company1", "company2"]
+            }
         )
     ]
 
@@ -920,7 +1207,16 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 arguments["company"],
                 arguments.get("period")
             )
-        
+
+        elif name == "compare_companies":
+            result = db_compare_companies(
+                arguments["company1"],
+                arguments["company2"],
+                arguments.get("period1"),
+                arguments.get("period2"),
+                arguments.get("statement_type", "income_statement")
+            )
+
         else:
             result = {"error": f"Okänt verktyg: {name}"}
         

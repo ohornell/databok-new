@@ -16,11 +16,17 @@ CREATE TABLE periods (
     quarter INTEGER NOT NULL CHECK (quarter BETWEEN 1 AND 4),
     year INTEGER NOT NULL,
     valuta TEXT,
+    language TEXT DEFAULT 'sv',  -- Dokumentspråk: sv, no, en
     pdf_hash TEXT,
     source_file TEXT,
+    extraction_meta JSONB,  -- Pipeline-info: retry_stats, validation, kostnad, etc.
     created_at TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(company_id, quarter, year)
 );
+
+-- Om tabellen redan finns, lägg till nya kolumner:
+-- ALTER TABLE periods ADD COLUMN IF NOT EXISTS language TEXT DEFAULT 'sv';
+-- ALTER TABLE periods ADD COLUMN IF NOT EXISTS extraction_meta JSONB;
 
 -- Finansiella rader
 CREATE TABLE financial_data (
@@ -83,8 +89,14 @@ CREATE INDEX idx_tables_type ON report_tables(table_type);
 CREATE INDEX idx_sections_embedding ON sections USING ivfflat (embedding vector_cosine_ops)
     WITH (lists = 100);
 
--- Fulltext-sökning på sektioner
-CREATE INDEX idx_sections_content_fts ON sections USING gin(to_tsvector('swedish', content));
+-- Fulltext-sökning på sektioner (använder 'simple' för språkagnostisk sökning)
+-- 'simple' fungerar för alla språk (sv, no, en) men utan stemming
+-- Semantisk sökning (embeddings) är primär sökmetod - FTS är komplement
+CREATE INDEX idx_sections_content_fts ON sections USING gin(to_tsvector('simple', content));
+
+-- Om indexet redan finns med 'swedish', kör:
+-- DROP INDEX IF EXISTS idx_sections_content_fts;
+-- CREATE INDEX idx_sections_content_fts ON sections USING gin(to_tsvector('simple', content));
 
 -- Grafer/diagram extraherade från rapporter
 CREATE TABLE charts (
@@ -102,6 +114,38 @@ CREATE TABLE charts (
 
 CREATE INDEX idx_charts_period ON charts(period_id);
 CREATE INDEX idx_charts_type ON charts(chart_type);
+
+-- ============================================
+-- SYNONYM-TABELL FÖR LABEL_EN NORMALISERING
+-- ============================================
+
+-- Synonym-tabell för att normalisera label_en vid jämförelser
+CREATE TABLE label_synonyms (
+    synonym TEXT PRIMARY KEY,
+    canonical TEXT NOT NULL
+);
+
+CREATE INDEX idx_label_synonyms_canonical ON label_synonyms(canonical);
+
+-- Funktion för att normalisera label_en
+CREATE OR REPLACE FUNCTION normalize_label_en(label TEXT)
+RETURNS TEXT AS $$
+DECLARE
+    result TEXT;
+BEGIN
+    SELECT canonical INTO result
+    FROM label_synonyms
+    WHERE synonym = LOWER(TRIM(label));
+
+    IF result IS NULL THEN
+        RETURN LOWER(TRIM(label));
+    END IF;
+
+    RETURN result;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+-- Kör migrations/002_label_synonyms.sql för att populera synonym-tabellen
 
 -- Row Level Security (valfritt - aktivera om du vill ha autentisering)
 -- ALTER TABLE companies ENABLE ROW LEVEL SECURITY;
