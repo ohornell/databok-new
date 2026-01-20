@@ -43,6 +43,14 @@
 - Claude Desktop visar inte källor från JSON-responsen
 - Claude Desktop visar inte ASCII-visualiseringar
 
+## Långsiktiga idéer
+
+- Styrelseanalytiker - extrahera och analysera styrelsematerial
+  - Nya dokumenttyper: styrelseprotokoll, beslutsunderlag, strategidokument
+  - Knowledge-tabell med strategikunskap, governance best practices, beslutsanalys
+  - Skills för: strategiutvärdering, riskanalys, ESG-bedömning, succession planning
+  - Kombinera med finansiell data för helhetsbild
+
 ## Klart
 
 - [x] Optimerat DB-queries (kombinerade source_file/pdf_hash i period SELECT)
