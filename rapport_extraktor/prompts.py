@@ -103,6 +103,12 @@ TABELL-FORMAT:
   "has_hierarchical_headers": true
 }
 
+VIKTIGT OM SIDNUMMER (page):
+- "page" ska vara PDF-sidnummer (1 = första sidan i PDF-filen)
+- Räkna från 1, oavsett vad som står tryckt på sidan
+- Om omslaget är PDF-sida 1, så är nästa sida PDF-sida 2
+- Använd INTE det tryckta sidnumret (t.ex. "sida 5" på sidan)
+
 ENTITY: "group" (koncern) eller "parent" (moderbolag)
 
 KOLUMNRUBRIKER - om hierarkiska (två nivåer):
@@ -131,8 +137,20 @@ GRAF-FORMAT:
   "id": "chart_1",
   "title": "Nettoomsättning per kvartal",
   "chart_type": "bar",
-  "page": 7
+  "page": 7,
+  "has_data_labels": true,
+  "data_point_count": 8
 }
+
+VIKTIGT FÖR GRAFER:
+- has_data_labels: true om diagrammet har SYNLIGA VÄRDEN på/över staplarna
+- data_point_count: uppskattning av antal datapunkter (antal staplar, punkter, etc.)
+
+Grafer med has_data_labels=true innehåller ofta FLERÅRIG historisk data som
+måste extraheras noggrant i Pass 2!
+
+OBS: "page" för sektioner och grafer följer samma regel som tabeller -
+använd PDF-sidnummer (1 = första sidan i filen), INTE tryckt sidnummer.
 
 ==============================================================================
 CHECKLISTA
@@ -156,6 +174,10 @@ STRUKTURKARTA:
 {structure_map_json}
 
 EXTRAHERA DESSA ELEMENT: {element_ids}
+
+SÄRSKILD UPPMÄRKSAMHET: Grafer markerade med "has_data_labels": true
+innehåller SYNLIGA DATAVÄRDEN som måste extraheras noggrant.
+Läs varje etikett/siffra på diagrammet - missa INGA datapunkter!
 
 ==============================================================================
 KRITISKT - EXTRAHERA ALLA TABELLER!
@@ -368,22 +390,52 @@ Om dokumentet är på engelska, sätt label_en = samma som label.
 Utelämna label_en ENDAST om du är osäker på korrekt översättning.
 
 ==============================================================================
-GRAFER
+GRAFER - KRITISKT FÖR VISUELLA DIAGRAM MED DATAVÄRDEN
 ==============================================================================
 
+VIKTIGT: Många rapporter har KPI-sidor med stapel-/linjediagram där faktiska
+värden visas DIREKT PÅ diagrammet (som etiketter på/över staplarna).
+
+DESSA DIAGRAM INNEHÅLLER OFTA FLERÅRIG DATA - MISSA INTE TIDIGARE ÅR!
+
+Typiskt exempel (KPI-sida med 3 diagram):
+- "Operating revenues" - stapeldiagram med 7 kvartal/år
+- "Operating margin" - stapeldiagram med procentvärden per period
+- "Diluted EPS" - stapeldiagram med EPS per kvartal
+
+FÖR VARJE DIAGRAM - EXTRAHERA ALLA SYNLIGA DATAPUNKTER:
+1. Läs VARJE etikett på/över staplarna noggrant
+2. Identifiera tidsperioden för varje stapel (Q1, Q2, Q3, Q4, helår, etc.)
+3. Inkludera ALLA perioder - även tidigare år (2021, 2022, 2023, etc.)
+4. Om det finns staplad data (t.ex. olika segment), extrahera varje segment
+
+GRAFFORMAT:
 {{
   "id": "chart_1",
-  "title": "Nettoomsättning per kvartal",
+  "title": "Operating revenues (NOKm)",
   "chart_type": "bar",
-  "page": 5,
-  "estimated": true,
+  "page": 3,
+  "estimated": false,
   "data_points": [
-    {{"label": "Q1 2024", "value": 841}}
+    {{"label": "Q1 2023", "value": 2847, "segment": "Investment Banking"}},
+    {{"label": "Q1 2023", "value": 823, "segment": "Equities"}},
+    {{"label": "Q2 2023", "value": 2650, "segment": "Investment Banking"}},
+    {{"label": "Q2 2023", "value": 790, "segment": "Equities"}},
+    {{"label": "Q3 2024", "value": 3102, "segment": "Investment Banking"}},
+    {{"label": "Q3 2024", "value": 956, "segment": "Equities"}}
   ]
 }}
 
-- estimated: true = värden avlästa visuellt (default)
-- estimated: false = exakta värden visas som etiketter
+FÄLT:
+- estimated: false = exakta värden visas som etiketter på diagrammet
+- estimated: true = värden uppskattade visuellt (stapelhöjd avläst)
+- segment: Om staplad data, ange segmentnamn (valfritt)
+
+CHECKLISTA FÖR VARJE DIAGRAM:
+☐ Har du läst ALLA etiketter på diagrammet?
+☐ Har du inkluderat ALLA tidsperioder (även historiska)?
+☐ Är procentvärden korrekt avlästa (61.1% → 61.1)?
+☐ Finns det staplad data som behöver separata segment?
 
 ==============================================================================
 CHECKLISTA

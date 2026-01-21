@@ -55,6 +55,14 @@ from supabase_client import (
     load_period,
     get_client,
 )
+from extraction_log import (
+    update_extraction_log,
+    regenerate_all_logs,
+    get_period_counts,
+    get_total_counts_from_db,
+    get_embedding_stats,
+    collect_all_errors,
+)
 from anthropic import AsyncAnthropic
 
 # ============================================
@@ -81,6 +89,10 @@ app = FastAPI(
 - **GET /companies/{slug}/periods** - Lista tillgängliga perioder för ett bolag
 - **GET /companies/{slug}/periods/{period}/data** - Hämta all data för en period
 - **POST /companies/{slug}/excel** - Generera Excel från befintlig databas-data
+
+### Statistik och loggning
+- **GET /stats** - Global statistik för alla bolag (antal rapporter, tabeller, kostnad)
+- **GET /stats/{slug}** - Detaljerad statistik för ett bolag (inkl. fel, embeddings)
 
 ### Status-värden (per fil)
 - `pending` - Väntar på att starta
@@ -296,6 +308,7 @@ class PeriodResponse(BaseModel):
     language: Optional[str]
     tables_count: int
     sections_count: int
+    charts_count: int
     has_extraction_meta: bool
 
 
@@ -822,14 +835,8 @@ async def get_company_periods(slug: str):
 
     result = []
     for p in periods.data:
-        # Räkna tabeller och sektioner
-        tables_count = client.table("report_tables").select(
-            "id", count="exact"
-        ).eq("period_id", p["id"]).execute()
-
-        sections_count = client.table("sections").select(
-            "id", count="exact"
-        ).eq("period_id", p["id"]).execute()
+        # Räkna tabeller, sektioner och grafer
+        counts = get_period_counts(client, p["id"])
 
         result.append(PeriodResponse(
             quarter=p["quarter"],
@@ -837,8 +844,9 @@ async def get_company_periods(slug: str):
             period_label=f"Q{p['quarter']} {p['year']}",
             valuta=p.get("valuta"),
             language=p.get("language"),
-            tables_count=tables_count.count or 0,
-            sections_count=sections_count.count or 0,
+            tables_count=counts["tables"],
+            sections_count=counts["sections"],
+            charts_count=counts["charts"],
             has_extraction_meta=p.get("extraction_meta") is not None
         ))
 
@@ -926,6 +934,311 @@ async def get_period_data(slug: str, period: str):
         raise HTTPException(404, f"Period {period} hittades inte för {company['name']}")
 
     return data
+
+
+# ============================================
+# LOGGING/STATS ENDPOINTS
+# ============================================
+
+class CompanyStatsResponse(BaseModel):
+    """Statistik för ett bolag."""
+    company_name: str
+    company_slug: str
+    total_reports: int
+    total_tables: int
+    total_sections: int
+    total_charts: int
+    total_cost_sek: float
+    total_time_seconds: float
+    embedding_stats: dict
+    errors: list[dict]
+
+
+class GlobalStatsResponse(BaseModel):
+    """Global statistik för alla bolag."""
+    total_companies: int
+    total_reports: int
+    total_tables: int
+    total_sections: int
+    total_charts: int
+    total_cost_sek: float
+    companies: list[dict]
+
+
+@app.get("/stats", response_model=GlobalStatsResponse)
+async def get_global_stats():
+    """
+    Hämta global statistik för alla bolag i databasen.
+
+    Returnerar översikt med antal rapporter, tabeller, sektioner och grafer
+    per bolag samt totalt.
+
+    Optimerad: Använder en enda SQL-query via RPC istället för N+1 queries.
+    """
+    client = get_client()
+
+    # Försök använda optimerad RPC-funktion (kräver migration 003)
+    try:
+        result = client.rpc("get_global_stats").execute()
+
+        if not result.data:
+            return GlobalStatsResponse(
+                total_companies=0,
+                total_reports=0,
+                total_tables=0,
+                total_sections=0,
+                total_charts=0,
+                total_cost_sek=0.0,
+                companies=[]
+            )
+
+        # Aggregera från RPC-resultat (redan grupperat per bolag)
+        company_stats = []
+        total_reports = 0
+        total_tables = 0
+        total_sections = 0
+        total_charts = 0
+        total_cost = 0.0
+
+        for row in result.data:
+            company_stats.append({
+                "name": row["company_name"],
+                "slug": row["company_slug"],
+                "reports": row["reports_count"],
+                "tables": row["tables_total"],
+                "sections": row["sections_total"],
+                "charts": row["charts_total"],
+                "cost_sek": round(float(row["cost_total"] or 0), 2),
+                "success_count": row.get("success_count", 0),
+                "partial_count": row.get("partial_count", 0),
+                "failed_count": row.get("failed_count", 0),
+            })
+            total_reports += row["reports_count"]
+            total_tables += row["tables_total"]
+            total_sections += row["sections_total"]
+            total_charts += row["charts_total"]
+            total_cost += float(row["cost_total"] or 0)
+
+        return GlobalStatsResponse(
+            total_companies=len(result.data),
+            total_reports=total_reports,
+            total_tables=total_tables,
+            total_sections=total_sections,
+            total_charts=total_charts,
+            total_cost_sek=round(total_cost, 2),
+            companies=company_stats
+        )
+
+    except Exception as e:
+        # Fallback till legacy-implementation om RPC inte finns
+        if "function" not in str(e).lower():
+            raise
+        return await _get_global_stats_legacy()
+
+
+async def _get_global_stats_legacy():
+    """Legacy-implementation för bakåtkompatibilitet (innan migration 003)."""
+    client = get_client()
+
+    companies = client.table("companies").select("id, name, slug").execute()
+
+    if not companies.data:
+        return GlobalStatsResponse(
+            total_companies=0,
+            total_reports=0,
+            total_tables=0,
+            total_sections=0,
+            total_charts=0,
+            total_cost_sek=0.0,
+            companies=[]
+        )
+
+    company_stats = []
+    total_reports = 0
+    total_tables = 0
+    total_sections = 0
+    total_charts = 0
+    total_cost = 0.0
+
+    for company in companies.data:
+        company_id = company["id"]
+
+        periods = client.table("periods").select(
+            "id, extraction_meta"
+        ).eq("company_id", company_id).execute()
+
+        num_reports = len(periods.data) if periods.data else 0
+        counts = get_total_counts_from_db(client, company_id)
+
+        cost = 0.0
+        for p in (periods.data or []):
+            meta = p.get("extraction_meta") or {}
+            cost += meta.get("total_cost_sek", 0) or 0
+
+        company_stats.append({
+            "name": company["name"],
+            "slug": company["slug"],
+            "reports": num_reports,
+            "tables": counts["tables"],
+            "sections": counts["sections"],
+            "charts": counts["charts"],
+            "cost_sek": round(cost, 2)
+        })
+
+        total_reports += num_reports
+        total_tables += counts["tables"]
+        total_sections += counts["sections"]
+        total_charts += counts["charts"]
+        total_cost += cost
+
+    return GlobalStatsResponse(
+        total_companies=len(companies.data),
+        total_reports=total_reports,
+        total_tables=total_tables,
+        total_sections=total_sections,
+        total_charts=total_charts,
+        total_cost_sek=round(total_cost, 2),
+        companies=company_stats
+    )
+
+
+@app.get("/stats/{slug}", response_model=CompanyStatsResponse)
+async def get_company_stats(slug: str):
+    """
+    Hämta detaljerad statistik för ett specifikt bolag.
+
+    Inkluderar:
+    - Antal rapporter, tabeller, sektioner, grafer
+    - Total kostnad och tid
+    - Embedding-status
+    - Lista med fel och varningar
+
+    Optimerad: Använder RPC-funktion istället för N+1 queries.
+    """
+    company = get_company_by_slug(slug)
+    if not company:
+        raise HTTPException(404, f"Bolag '{slug}' hittades inte")
+
+    client = get_client()
+    company_id = company["id"]
+
+    # Försök använda optimerad RPC-funktion (kräver migration 003)
+    try:
+        result = client.rpc("get_company_stats", {"p_company_id": company_id}).execute()
+
+        if not result.data:
+            return CompanyStatsResponse(
+                company_name=company["name"],
+                company_slug=company["slug"],
+                total_reports=0,
+                total_tables=0,
+                total_sections=0,
+                total_charts=0,
+                total_cost_sek=0.0,
+                total_time_seconds=0.0,
+                embedding_stats={"sections_total": 0, "sections_with_embedding": 0},
+                errors=[]
+            )
+
+        # Aggregera från RPC-resultat (redan per period)
+        total_tables = sum(p["tables_count"] or 0 for p in result.data)
+        total_sections = sum(p["sections_count"] or 0 for p in result.data)
+        total_charts = sum(p["charts_count"] or 0 for p in result.data)
+        total_embeddings = sum(p["embeddings_count"] or 0 for p in result.data)
+        total_cost = sum(float(p["cost_sek"] or 0) for p in result.data)
+        total_time = sum(float(p["extraction_time_seconds"] or 0) for p in result.data)
+
+        # Hämta fel från extraction_errors-tabellen
+        period_ids = [p["period_id"] for p in result.data]
+        errors = []
+        if period_ids:
+            try:
+                error_result = client.table("extraction_errors").select(
+                    "error_type, severity, component, details, period_id"
+                ).in_("period_id", period_ids).eq("resolved", False).execute()
+
+                for e in (error_result.data or []):
+                    # Hitta period-info
+                    period = next((p for p in result.data if p["period_id"] == e["period_id"]), None)
+                    errors.append({
+                        "period": f"Q{period['quarter']} {period['year']}" if period else "Okänd",
+                        "error_type": e["error_type"],
+                        "severity": e["severity"],
+                        "component": e["component"],
+                        "details": e.get("details"),
+                    })
+            except Exception:
+                # extraction_errors-tabellen kanske inte finns
+                pass
+
+        return CompanyStatsResponse(
+            company_name=company["name"],
+            company_slug=company["slug"],
+            total_reports=len(result.data),
+            total_tables=total_tables,
+            total_sections=total_sections,
+            total_charts=total_charts,
+            total_cost_sek=round(total_cost, 2),
+            total_time_seconds=round(total_time, 2),
+            embedding_stats={
+                "sections_total": total_sections,
+                "sections_with_embedding": total_embeddings
+            },
+            errors=errors
+        )
+
+    except Exception as e:
+        # Fallback till legacy-implementation om RPC inte finns
+        if "function" not in str(e).lower():
+            raise
+        return await _get_company_stats_legacy(company, client)
+
+
+async def _get_company_stats_legacy(company: dict, client):
+    """Legacy-implementation för bakåtkompatibilitet (innan migration 003)."""
+    company_id = company["id"]
+
+    periods = client.table("periods").select(
+        "id, quarter, year, extraction_meta"
+    ).eq("company_id", company_id).order("year", desc=True).order("quarter", desc=True).execute()
+
+    counts = get_total_counts_from_db(client, company_id)
+
+    total_cost = 0.0
+    total_time = 0.0
+    report_data = []
+
+    for p in (periods.data or []):
+        period_counts = get_period_counts(client, p["id"])
+        meta = p.get("extraction_meta") or {}
+
+        total_cost += meta.get("total_cost_sek", 0) or 0
+        total_time += meta.get("total_elapsed_seconds", 0) or 0
+
+        report_data.append({
+            "quarter": p["quarter"],
+            "year": p["year"],
+            "tables": period_counts["tables"],
+            "sections": period_counts["sections"],
+            "charts": period_counts["charts"],
+            "extraction_meta": meta,
+        })
+
+    emb_stats = get_embedding_stats(client, company_id)
+    errors = collect_all_errors(report_data, company["name"])
+
+    return CompanyStatsResponse(
+        company_name=company["name"],
+        company_slug=company["slug"],
+        total_reports=len(periods.data) if periods.data else 0,
+        total_tables=counts["tables"],
+        total_sections=counts["sections"],
+        total_charts=counts["charts"],
+        total_cost_sek=round(total_cost, 2),
+        total_time_seconds=round(total_time, 2),
+        embedding_stats=emb_stats,
+        errors=errors
+    )
 
 
 # ============================================

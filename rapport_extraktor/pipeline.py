@@ -11,6 +11,7 @@ Pass 2 och 3 körs parallellt efter Pass 1.
 
 import asyncio
 import base64
+import io
 import json
 import os
 import re
@@ -20,6 +21,7 @@ from typing import Callable, TypedDict
 
 from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
+from pypdf import PdfReader, PdfWriter
 
 # Ladda .env-fil
 load_dotenv()
@@ -28,6 +30,8 @@ from prompts import PASS_1_STRUCTURE_PROMPT, PASS_2_TABLES_PROMPT, PASS_3_TEXT_P
 from supabase_client import (
     get_or_create_company,
     save_period,
+    save_period_atomic_async,
+    update_period_status,
     get_pdf_hash,
     period_exists,
     load_period,
@@ -38,15 +42,29 @@ from validation import (
     format_validation_report,
     ValidationResult,
 )
+from extraction_log import process_extraction_complete
+from checkpoint import (
+    generate_batch_id,
+    get_completed_files,
+    add_completed_file,
+    add_failed_file,
+    get_batch_progress,
+    save_checkpoint,
+)
 
 # Modell-IDs
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 SONNET_MODEL = "claude-sonnet-4-5-20250929"
 
 # Konfiguration
-MAX_CONCURRENT = 10
+# Token limits: 450K input/min TOTALT för alla requests till en modell
+# Med ~75K tokens/PDF → max ~6 samtida requests för att hålla under 450K
+# Pass körs sekventiellt per PDF, så faktisk belastning sprids ut över tid
+MAX_CONCURRENT = 4    # 4 samtida × 75K = 300K tokens, säker marginal under 450K limit
 MAX_RETRIES = 3
-API_TIMEOUT = 300  # 5 minuter timeout per API-anrop
+API_TIMEOUT = 300     # 5 minuter timeout per API-anrop
+BATCH_SIZE = 10       # Antal PDFs att processa åt gången
+BATCH_TIMEOUT = 3600  # 1 timme max per batch
 
 # Priser (USD per 1M tokens)
 HAIKU_INPUT_PRICE = 0.80
@@ -54,6 +72,33 @@ HAIKU_OUTPUT_PRICE = 4.00
 SONNET_INPUT_PRICE = 3.00
 SONNET_OUTPUT_PRICE = 15.00
 USD_TO_SEK = 10.50
+
+
+def extract_pdf_pages(pdf_bytes: bytes, pages: list[int]) -> bytes:
+    """
+    Extrahera specifika sidor från PDF.
+
+    Args:
+        pdf_bytes: Rå PDF-data
+        pages: Lista med sidnummer (1-indexerade, som PDF-viewer)
+
+    Returns:
+        Ny PDF med endast de angivna sidorna
+    """
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    writer = PdfWriter()
+
+    total_pages = len(reader.pages)
+
+    for page_num in sorted(pages):
+        # Konvertera till 0-indexerat för pypdf
+        idx = page_num - 1
+        if 0 <= idx < total_pages:
+            writer.add_page(reader.pages[idx])
+
+    output = io.BytesIO()
+    writer.write(output)
+    return output.getvalue()
 
 
 class PassResult(TypedDict):
@@ -344,23 +389,27 @@ async def run_pass_2(
         )
 
 
-async def validate_and_retry_with_haiku(
-    pdf_base64: str,
+async def validate_and_retry_with_sonnet(
+    pdf_bytes: bytes,
     tables: list[dict],
     structure_map: dict,
     client: AsyncAnthropic,
     semaphore: asyncio.Semaphore,
 ) -> tuple[list[dict], ValidationResult, RetryStats]:
     """
-    Validera tabeller och kör ETT retry med Haiku om något saknas eller har fel.
+    Validera tabeller och kör ETT retry med Sonnet på relevanta sidor.
+
+    Skillnad från validate_and_retry_with_haiku:
+    1. Använder Sonnet istället för Haiku (bättre kvalitet)
+    2. Extraherar endast relevanta sidor (lägre kostnad)
 
     Flöde:
     1. Validera extraherade tabeller (lokal, ingen API)
     2. Hitta saknade tabeller (finns i Pass 1 men inte Pass 2)
-    3. Om något saknas ELLER har fel → ETT Haiku-anrop för att fixa allt
+    3. Om något saknas ELLER har fel → extrahera relevanta sidor + Sonnet-anrop
 
     Args:
-        pdf_base64: Base64-kodad PDF
+        pdf_bytes: Rå PDF-data (bytes, inte base64)
         tables: Lista med extraherade tabeller från Pass 2
         structure_map: Strukturkarta från Pass 1
         client: Anthropic async-klient
@@ -413,7 +462,7 @@ async def validate_and_retry_with_haiku(
                     print(f"      - {tid}: {t.get('title', 'Okänd')}", flush=True)
                     break
 
-    # Steg 4: Bygg prompt för Haiku retry
+    # Steg 4: Bygg prompt och samla sidor
     start_time = time.perf_counter()
 
     # Hämta metadata
@@ -423,37 +472,68 @@ async def validate_and_retry_with_haiku(
 
     # Bygg lista över tabeller att extrahera/korrigera
     tables_to_fix = []
+    pages_needed = set()
 
     # Saknade tabeller - hämta info från Pass 1
     for tid in missing_table_ids:
         for t in structure_map.get("structure_map", {}).get("tables", []):
             if t["id"] == tid:
+                page = t.get("page")
                 tables_to_fix.append({
                     "id": tid,
                     "title": t.get("title", "Okänd"),
                     "type": t.get("type", "other"),
-                    "page": t.get("page", "?"),
+                    "page": page if page else "?",
                     "issue": "SAKNAS - extrahera från PDF",
                     "columns": t.get("column_headers", [])
                 })
+                if isinstance(page, int) and page >= 1:
+                    pages_needed.add(page)
+                    if page > 1:
+                        pages_needed.add(page - 1)  # Sidan innan för kontext
+                    pages_needed.add(page + 1)  # Sidan efter
                 break
 
     # Tabeller med fel - inkludera nuvarande data + felbeskrivning
     for tid in tables_with_errors:
         for t in current_tables:
             if t.get("id") == tid:
-                # Hitta felen för denna tabell
+                page = t.get("page")
                 errors = [e for e in validation_result.errors if e.table_id == tid]
                 error_msgs = [e.message for e in errors]
                 tables_to_fix.append({
                     "id": tid,
                     "title": t.get("title", "Okänd"),
                     "type": t.get("type", "other"),
-                    "page": t.get("page", "?"),
+                    "page": page if page else "?",
                     "issue": f"FEL: {'; '.join(error_msgs)}",
                     "columns": t.get("columns", [])
                 })
+                if isinstance(page, int) and page >= 1:
+                    pages_needed.add(page)
+                    if page > 1:
+                        pages_needed.add(page - 1)
+                    pages_needed.add(page + 1)
                 break
+
+    # Steg 5: Extrahera relevanta sidor från PDF
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    total_pages = len(reader.pages)
+
+    # Begränsa till giltiga sidor
+    pages_needed = {p for p in pages_needed if 1 <= p <= total_pages}
+
+    # Extrahera bara relevanta sidor om det sparar >50% av PDF:en
+    if pages_needed and len(pages_needed) < total_pages * 0.5:
+        partial_pdf_bytes = extract_pdf_pages(pdf_bytes, sorted(pages_needed))
+        partial_pdf_base64 = base64.standard_b64encode(partial_pdf_bytes).decode()
+        pages_info = f" (sidor: {sorted(pages_needed)})"
+        page_note = f"\n\nVIKTIGT: Denna PDF innehåller endast sidorna {sorted(pages_needed)} från originaldokumentet."
+    else:
+        # Använd hela PDF:en
+        partial_pdf_base64 = base64.standard_b64encode(pdf_bytes).decode()
+        pages_info = f" (hela PDF:en, {total_pages} sidor)"
+        page_note = ""
 
     tables_json = json.dumps(tables_to_fix, ensure_ascii=False, indent=2)
     all_ids = sorted(list(missing_table_ids | tables_with_errors))
@@ -490,19 +570,19 @@ KRITISKA REGLER:
 3. Första värdet i values är ALLTID null (label-kolumnen)
 4. Antal values MÅSTE matcha antal columns
 5. Konvertera tal korrekt: {"komma=decimal, mellanslag=tusen" if number_format == "swedish" else "punkt=decimal, komma=tusen"}
-"""
+{page_note}"""
 
-    # Steg 5: Kör Haiku retry
+    # Steg 6: Kör Sonnet retry
     async with semaphore:
         try:
             full_response_text = ""
             input_tokens = 0
             output_tokens = 0
 
-            print(f"\n   [RETRY] Kör Haiku för {len(tables_to_fix)} tabeller...", flush=True)
+            print(f"\n   [RETRY] Kör Sonnet för {len(tables_to_fix)} tabeller{pages_info}...", flush=True)
 
             async with client.messages.stream(
-                model=HAIKU_MODEL,
+                model=SONNET_MODEL,
                 max_tokens=32000,
                 messages=[{
                     "role": "user",
@@ -512,7 +592,7 @@ KRITISKA REGLER:
                             "source": {
                                 "type": "base64",
                                 "media_type": "application/pdf",
-                                "data": pdf_base64
+                                "data": partial_pdf_base64
                             }
                         },
                         {
@@ -531,7 +611,7 @@ KRITISKA REGLER:
             elapsed = time.perf_counter() - start_time
             result = parse_json_response(full_response_text)
 
-            # Steg 6: Uppdatera tabeller med resultat
+            # Steg 7: Uppdatera tabeller med resultat
             fixed_tables = result.get("tables", [])
             fixed_ids = {t.get("id") for t in fixed_tables}
 
@@ -541,8 +621,8 @@ KRITISKA REGLER:
             # Lägg till fixade tabeller
             current_tables.extend(fixed_tables)
 
-            # Beräkna kostnad (Haiku-priser)
-            retry_cost = (input_tokens * HAIKU_INPUT_PRICE + output_tokens * HAIKU_OUTPUT_PRICE) / 1_000_000 * USD_TO_SEK
+            # Beräkna kostnad (Sonnet-priser)
+            retry_cost = (input_tokens * SONNET_INPUT_PRICE + output_tokens * SONNET_OUTPUT_PRICE) / 1_000_000 * USD_TO_SEK
 
             print(f"      [RETRY KLAR] {len(fixed_tables)}/{len(tables_to_fix)} tabeller fixade "
                   f"({elapsed:.1f}s, {input_tokens:,}+{output_tokens:,} tokens, {retry_cost:.2f} SEK)", flush=True)
@@ -563,7 +643,7 @@ KRITISKA REGLER:
 
         except Exception as e:
             elapsed = time.perf_counter() - start_time
-            print(f"   [VARNING] Haiku retry misslyckades: {e}", flush=True)
+            print(f"   [VARNING] Sonnet retry misslyckades: {e}", flush=True)
 
             retry_stats = {
                 "retry_count": 1,
@@ -695,8 +775,10 @@ async def extract_pdf_multi_pass(
     client: AsyncAnthropic,
     semaphore: asyncio.Semaphore,
     company_id: str,
+    company_name: str,
     progress_callback: Callable[[str, str, dict | None], None] | None = None,
     use_cache: bool = True,
+    base_folder: str | None = None,
 ) -> dict:
     """
     Multi-pass extraktion av en PDF.
@@ -706,8 +788,10 @@ async def extract_pdf_multi_pass(
         client: Anthropic async-klient
         semaphore: För rate-limiting
         company_id: Bolagets UUID
+        company_name: Bolagsnamn (för loggning och filflyttning)
         progress_callback: Callback för progress
         use_cache: Om True, använd cachad data
+        base_folder: Basmapp för rapporter (för filflyttning efter extraktion)
 
     Returns:
         Dict kompatibelt med excel_builder.py
@@ -781,13 +865,13 @@ async def extract_pdf_multi_pass(
                   f"{pass_3['input_tokens']:,}+{pass_3['output_tokens']:,} tokens | "
                   f"{p3_cost:.2f} SEK", flush=True)
 
-            # === VALIDERING & RETRY (förenklad med Haiku) ===
+            # === VALIDERING & RETRY (Sonnet med sidextraktion) ===
             if progress_callback:
                 progress_callback(pdf_path, "validating", None)
 
             tables = pass_2["data"].get("tables", [])
-            validated_tables, validation_result, retry_stats = await validate_and_retry_with_haiku(
-                pdf_base64, tables, pass_1["data"], client, semaphore
+            validated_tables, validation_result, retry_stats = await validate_and_retry_with_sonnet(
+                pdf_bytes, tables, pass_1["data"], client, semaphore
             )
 
             # Uppdatera pass_2 med validerade tabeller
@@ -834,6 +918,29 @@ async def extract_pdf_multi_pass(
             total_cost_with_retries = result["total_cost_sek"] + retry_stats["cost_sek"]
             total_elapsed = time.perf_counter() - extraction_start
 
+            # === PASS 1 STATISTIK (för loggning) ===
+            structure_map = pass_1["data"].get("structure_map", {})
+            pass1_tables = structure_map.get("tables", [])
+            pass1_sections = structure_map.get("sections", [])
+            pass1_charts = structure_map.get("charts", [])
+
+            # Hitta saknade tabeller (fanns i pass 1 men inte extraherade)
+            expected_table_ids = {t["id"] for t in pass1_tables}
+            extracted_table_ids = {t.get("id") for t in result["tables"]}
+            missing_table_ids = expected_table_ids - extracted_table_ids
+
+            missing_tables = []
+            for tid in missing_table_ids:
+                for t in pass1_tables:
+                    if t["id"] == tid:
+                        missing_tables.append({
+                            "table_id": tid,
+                            "table_title": t.get("title", "Okänd"),
+                            "page": t.get("page", "?"),
+                            "type": t.get("type", "other"),
+                        })
+                        break
+
             # Konvertera till format kompatibelt med excel_builder
             output = {
                 "metadata": result["metadata"],
@@ -856,6 +963,12 @@ async def extract_pdf_multi_pass(
                     "retry_stats": retry_stats,
                     "total_cost_sek": round(total_cost_with_retries, 2),
                     "total_elapsed_seconds": round(total_elapsed, 2),
+                    "pass1_counts": {
+                        "tables": len(pass1_tables),
+                        "sections": len(pass1_sections),
+                        "charts": len(pass1_charts),
+                    },
+                    "missing_tables": missing_tables,
                     "validation": {
                         "tables": {
                             "is_valid": validation_result.is_valid,
@@ -897,11 +1010,93 @@ async def extract_pdf_multi_pass(
             print(f"\n   --- {filename} KLAR ---")
             print(f"   Tid: {total_elapsed:.1f}s | Tokens: {total_input:,}+{total_output:,} | Kostnad: {total_cost_with_retries:.2f} SEK")
             if retry_stats["retry_count"] > 0:
-                print(f"   Retry (Haiku): {retry_stats['tables_retried']} tabeller ({retry_stats['cost_sek']:.2f} SEK)")
+                print(f"   Retry (Sonnet): {retry_stats['tables_retried']} tabeller ({retry_stats['cost_sek']:.2f} SEK)")
             print(f"   Tabeller: {len(result['tables'])} | Sektioner: {len(result['sections'])} | Grafer: {len(result['charts'])}")
 
-            # Spara till Supabase
-            save_period(company_id, output, pdf_hash, str(pdf_path))
+            # Samla alla fel för explicit loggning
+            all_errors = []
+            final_status = "success"
+
+            # Tabell-valideringsfel
+            if validation_result.errors:
+                final_status = "partial"
+                for e in validation_result.errors:
+                    all_errors.append({
+                        "error_type": e.error_type,
+                        "severity": "error",
+                        "component": "tables",
+                        "details": {
+                            "table_id": e.table_id,
+                            "table_title": e.table_title,
+                            "message": e.message,
+                            "row_index": e.row_index
+                        }
+                    })
+
+            # Section-varningar (loggas som warnings)
+            for w in section_validation.warnings:
+                all_errors.append({
+                    "error_type": w.error_type,
+                    "severity": "warning",
+                    "component": "sections",
+                    "details": {
+                        "section_id": w.table_id,
+                        "section_title": w.table_title,
+                        "message": w.message
+                    }
+                })
+
+            # Spara till Supabase med atomisk sparning (async för att inte blockera)
+            period_id, section_ids = await save_period_atomic_async(company_id, output, pdf_hash, str(pdf_path))
+
+            # Generera embeddings med explicit felhantering (async för att inte blockera)
+            embeddings_count = 0
+            if section_ids:
+                try:
+                    from supabase_client import generate_embeddings_for_sections_async
+                    embeddings_count = await generate_embeddings_for_sections_async(section_ids)
+                    if embeddings_count > 0:
+                        print(f"   [EMBEDDING] {embeddings_count} sections har fatt embeddings")
+                    if embeddings_count < len(section_ids):
+                        all_errors.append({
+                            "error_type": "embeddings_incomplete",
+                            "severity": "warning",
+                            "component": "embeddings",
+                            "details": {
+                                "expected": len(section_ids),
+                                "generated": embeddings_count
+                            }
+                        })
+                except Exception as emb_err:
+                    all_errors.append({
+                        "error_type": "embeddings_failed",
+                        "severity": "error",
+                        "component": "embeddings",
+                        "details": {"error": str(emb_err)}
+                    })
+                    if final_status == "success":
+                        final_status = "partial"
+                    print(f"   [EMBEDDING] Kunde inte generera embeddings: {emb_err}")
+
+            # Uppdatera slutstatus
+            update_period_status(
+                period_id,
+                status=final_status,
+                errors=all_errors if all_errors else None,
+                embeddings_count=embeddings_count
+            )
+
+            if final_status == "partial":
+                error_count = len([e for e in all_errors if e["severity"] in ("error", "critical")])
+                warning_count = len([e for e in all_errors if e["severity"] == "warning"])
+                print(f"   [STATUS] partial - {error_count} fel, {warning_count} varningar")
+
+            # Flytta fil och uppdatera logg (om base_folder är satt)
+            if base_folder:
+                try:
+                    process_extraction_complete(pdf_path, company_name, base_folder)
+                except Exception as log_err:
+                    print(f"   [VARNING] Kunde inte flytta/logga: {log_err}")
 
             if progress_callback:
                 progress_callback(pdf_path, "done", {
@@ -934,21 +1129,32 @@ async def extract_all_pdfs_multi_pass(
     company_name: str,
     on_progress: Callable[[str, str], None] | None = None,
     use_cache: bool = True,
+    base_folder: str | None = None,
+    batch_id: str | None = None,
+    resume: bool = True,
+    quiet: bool = False,
 ) -> tuple[list[dict], list[tuple[str, Exception]]]:
     """
-    Multi-pass extraktion av alla PDFs.
+    Multi-pass extraktion av alla PDFs med batch-processning och checkpointing.
 
-    Samma signatur som extractor.extract_all_pdfs för kompatibilitet.
+    Processerar PDFs i batchar om BATCH_SIZE för att kontrollera minnesanvändning.
+    Sparar progress efter varje fil för att möjliggöra återstart vid avbrott.
 
     Args:
         pdf_paths: Lista med sökvägar till PDF-filer
         company_name: Bolagsnamn för datalagring
         on_progress: Callback för progress-uppdateringar
-        use_cache: Om True, använd cachad data
+        use_cache: Om True, använd cachad data från databasen
+        base_folder: Basmapp för rapporter (för filflyttning efter extraktion)
+        batch_id: Unikt ID för denna batch (genereras automatiskt om None)
+        resume: Om True, skippa redan processade filer från tidigare körning
+        quiet: Om True, undertryck progress-utskrifter (använd med progress-tracker)
 
     Returns:
         Tuple av (lyckade resultat, misslyckade med fel)
     """
+    import gc
+
     # Ladda om .env för att få senaste nyckeln
     load_dotenv(override=True)
 
@@ -963,24 +1169,160 @@ async def extract_all_pdfs_multi_pass(
     company = get_or_create_company(company_name)
     company_id = company["id"]
 
+    # Generera batch-ID om inget anges
+    if batch_id is None:
+        batch_id = generate_batch_id(company_id)
+
+    # Hämta redan processade filer om vi återupptar
+    completed_files: set[str] = set()
+    if resume:
+        completed_files = get_completed_files(batch_id)
+        if completed_files and not quiet:
+            print(f"\n[CHECKPOINT] Återupptar batch {batch_id}")
+            print(f"   Redan klara: {len(completed_files)}/{len(pdf_paths)} filer")
+
+    # Filtrera bort redan processade
+    remaining_paths = [p for p in pdf_paths if str(p) not in completed_files]
+
+    if not remaining_paths:
+        if not quiet:
+            print(f"\n[CHECKPOINT] Alla {len(pdf_paths)} filer redan processade!")
+        return [], []
+
+    # Initiera checkpoint med total count
+    save_checkpoint(
+        batch_id=batch_id,
+        completed=list(completed_files),
+        failed=[],
+        total_files=len(pdf_paths)
+    )
+
     client = AsyncAnthropic(api_key=api_key, timeout=API_TIMEOUT)
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
-    async def safe_extract(path: str):
+    all_successful: list[dict] = []
+    all_failed: list[tuple[str, Exception]] = []
+
+    async def safe_extract(path: str) -> dict | tuple[str, Exception]:
         """Wrapper som fångar fel istället för att krascha"""
         try:
             return await extract_pdf_multi_pass(
-                path, client, semaphore, company_id,
-                on_progress, use_cache
+                path, client, semaphore, company_id, company_name,
+                on_progress, use_cache, base_folder
             )
         except Exception as e:
             return (path, e)
 
-    # Kör alla extraktioner parallellt
-    results = await asyncio.gather(*[safe_extract(p) for p in pdf_paths])
+    # Processa i batchar för minneskontroll
+    total_batches = (len(remaining_paths) + BATCH_SIZE - 1) // BATCH_SIZE
+    if not quiet:
+        print(f"\n[BATCH] Processerar {len(remaining_paths)} filer i {total_batches} batchar à {BATCH_SIZE}")
 
-    # Separera lyckade och misslyckade
-    successful = [r for r in results if isinstance(r, dict)]
-    failed = [r for r in results if isinstance(r, tuple)]
+    for batch_num, i in enumerate(range(0, len(remaining_paths), BATCH_SIZE), 1):
+        batch = remaining_paths[i:i + BATCH_SIZE]
+        if not quiet:
+            print(f"\n[BATCH {batch_num}/{total_batches}] Startar {len(batch)} filer...")
 
-    return successful, failed
+        # Kör denna batch parallellt med timeout
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(*[safe_extract(p) for p in batch]),
+                timeout=BATCH_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            if not quiet:
+                print(f"   [TIMEOUT] Batch {batch_num} tog över {BATCH_TIMEOUT}s - markerar som misslyckade")
+            for path in batch:
+                all_failed.append((path, TimeoutError(f"Batch timeout efter {BATCH_TIMEOUT}s")))
+                add_failed_file(batch_id, str(path), f"Batch timeout efter {BATCH_TIMEOUT}s", len(pdf_paths))
+            continue
+
+        # Processa resultat och uppdatera checkpoint
+        for path, result in zip(batch, results):
+            if isinstance(result, dict):
+                all_successful.append(result)
+                add_completed_file(batch_id, str(path), len(pdf_paths))
+            else:
+                # result är tuple (path, exception)
+                all_failed.append(result)
+                _, error = result
+                add_failed_file(batch_id, str(path), str(error), len(pdf_paths))
+
+        # Progress-rapport
+        completed, failed, total = get_batch_progress(batch_id)
+        if not quiet:
+            print(f"   Progress: {completed}/{total} klara, {failed} misslyckade")
+
+        # Explicit minnesrensning mellan batchar
+        gc.collect()
+
+        # Kort paus mellan batchar för att undvika rate limits
+        if i + BATCH_SIZE < len(remaining_paths):
+            await asyncio.sleep(2)
+
+    # Slutrapport
+    if not quiet:
+        print(f"\n[KLAR] Batch {batch_id} färdig:")
+        print(f"   Lyckade: {len(all_successful)}")
+        print(f"   Misslyckade: {len(all_failed)}")
+
+    return all_successful, all_failed
+
+
+async def retry_failed_extractions(
+    batch_id: str,
+    company_name: str,
+    on_progress: Callable[[str, str], None] | None = None,
+    use_cache: bool = False,
+    base_folder: str | None = None,
+    quiet: bool = False,
+) -> tuple[list[dict], list[tuple[str, Exception]]]:
+    """
+    Kör om misslyckade extraktioner från en tidigare batch.
+
+    Args:
+        batch_id: ID för batchen att återförsöka
+        company_name: Bolagsnamn
+        on_progress: Progress callback
+        use_cache: Om True, använd cache (default False för retry)
+        base_folder: Basmapp för rapporter
+        quiet: Om True, undertryck progress-utskrifter
+
+    Returns:
+        Tuple av (lyckade, misslyckade)
+    """
+    from checkpoint import get_failed_files, clear_checkpoint
+
+    failed_files = get_failed_files(batch_id)
+    if not failed_files:
+        if not quiet:
+            print(f"[RETRY] Inga misslyckade filer att köra om för batch {batch_id}")
+        return [], []
+
+    # Filtrera till filer som fortfarande existerar
+    existing_paths = [
+        f["path"] for f in failed_files
+        if Path(f["path"]).exists()
+    ]
+
+    if not existing_paths:
+        if not quiet:
+            print(f"[RETRY] Inga misslyckade filer existerar längre")
+        return [], []
+
+    if not quiet:
+        print(f"\n[RETRY] Kör om {len(existing_paths)} misslyckade filer från batch {batch_id}")
+
+    # Skapa ny batch för retry
+    retry_batch_id = f"retry_{batch_id}"
+
+    return await extract_all_pdfs_multi_pass(
+        pdf_paths=existing_paths,
+        company_name=company_name,
+        on_progress=on_progress,
+        use_cache=use_cache,
+        base_folder=base_folder,
+        batch_id=retry_batch_id,
+        resume=False,  # Kör alltid om vid retry
+        quiet=quiet,
+    )

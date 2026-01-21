@@ -1,6 +1,15 @@
+# Claude API
 anthropic>=0.76.0
+
+# Excel-generering
 openpyxl>=3.1.0
+
+# Databas
 supabase>=2.0.0
-python-dotenv>=1.0.0
+
+# PDF-hantering (sidextraktion för retry)
 pypdf>=4.0.0
-watchdog>=3.0.0
+
+# Utilities
+python-dotenv>=1.0.0
+requests>=2.31.0

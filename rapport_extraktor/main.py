@@ -55,6 +55,40 @@ def calculate_cost(input_tokens: int, output_tokens: int, model: str = "sonnet")
     return usd * USD_TO_SEK
 
 
+def get_databook_path(
+    filename: str,
+    company_name: str,
+    base_folder: str | Path | None = None
+) -> Path:
+    """
+    Beräkna sökväg för databok-fil i bolagets ligger_i_databasen-mapp.
+
+    Args:
+        filename: Filnamn för databoken (t.ex. "ABGSC Q2 25 - Q3 25.xlsx")
+        company_name: Bolagsnamn (används för att hitta mappen)
+        base_folder: Basmapp där alla_rapporter finns (default: alla_rapporter/)
+
+    Returns:
+        Path till där databoken ska sparas
+    """
+    if base_folder is None:
+        # Anta att vi kör från rapport_extraktor, gå upp en nivå till alla_rapporter
+        base_folder = Path(__file__).parent.parent / "alla_rapporter"
+    else:
+        base_folder = Path(base_folder)
+
+    # Skapa slug från bolagsnamn
+    company_slug = slugify(company_name)
+
+    # Sökväg till ligger_i_databasen
+    target_folder = base_folder / company_slug / "ligger_i_databasen"
+
+    # Skapa mappen om den inte finns
+    target_folder.mkdir(parents=True, exist_ok=True)
+
+    return target_folder / filename
+
+
 def print_pipeline_details(results: list[dict]):
     """Visa detaljerad timing och kostnad per pass for multi-pass extraktion."""
     for result in results:
@@ -136,10 +170,9 @@ def create_progress_tracker(pdf_paths: list[str]):
     }
 
     def render():
-        # Rensa och flytta cursor - använd fler rader för säkerhet
-        num_lines = len(files) + 2
-        sys.stdout.write(f"\033[{num_lines}A")  # Flytta upp
-        sys.stdout.write("\033[J")  # Rensa allt nedanför cursor
+        # Flytta cursor upp till första progress-raden
+        num_lines = len(files) + 1  # +1 för total-rad
+        sys.stdout.write(f"\033[{num_lines}A")
 
         for path in path_order:
             info = files[path]
@@ -173,13 +206,14 @@ def create_progress_tracker(pdf_paths: list[str]):
                 icon = "[?]"
                 details = ""
 
-            print(f"{icon} {info['name']:<35} {details}")
+            # Rensa ENDAST denna rad, skriv sedan innehåll
+            sys.stdout.write(f"\033[2K{icon} {info['name']:<35} {details}\n")
 
-        # Totalt
+        # Totalt - rensa endast denna rad
         total_tokens = state["total_input_tokens"] + state["total_output_tokens"]
         total_cost = state["total_cost"]
         elapsed = time.time() - state["start_time"]
-        print(f"    Totalt: {total_tokens:,} tokens | {total_cost:.2f} kr | {format_time(elapsed)}")
+        sys.stdout.write(f"\033[2K    Totalt: {total_tokens:,} tokens | {total_cost:.2f} kr | {format_time(elapsed)}\n")
         sys.stdout.flush()
 
     def on_progress(pdf_path: str, status: str, token_info: dict | None = None):
@@ -213,8 +247,8 @@ def create_progress_tracker(pdf_paths: list[str]):
 
         render()
 
-    # Initial render - skapa plats för alla rader
-    for _ in range(len(files) + 2):
+    # Initial render - skapa plats för alla rader (files + 1 total-rad)
+    for _ in range(len(files) + 1):
         print()
     render()
 
@@ -258,6 +292,7 @@ def run_interactive_mode(pdf_path: str | None = None):
     """
     import re
     from supabase_client import get_or_create_company, period_exists, get_pdf_hash, load_all_periods
+    from extraction_log import sync_files_with_database
 
     # Verifiera databas först
     ok, message = check_database_setup()
@@ -316,6 +351,17 @@ def run_interactive_mode(pdf_path: str | None = None):
         print("❌ Ange ett nummer.")
         return
 
+    # === SYNKRONISERA FILER I BAKGRUNDEN ===
+    # Automatiskt flytta filer baserat på databasstatus
+    company_slug = slugify(company_name)
+    base_folder = Path(__file__).parent.parent / "alla_rapporter"
+    if base_folder.exists():
+        sync_result = sync_files_with_database(company_slug, str(base_folder))
+        if sync_result["moved_to_db"] > 0:
+            print(f"   [SYNC] Flyttade {sync_result['moved_to_db']} fil(er) till ligger_i_databasen/")
+        if sync_result["moved_to_extract"] > 0:
+            print(f"   [SYNC] Flyttade {sync_result['moved_to_extract']} fil(er) till skall_extractas/")
+
     # === VÄLJ LÄGE ===
     print(f"\n{'═' * 50}")
     print(f"  Bolag: {company_name}")
@@ -357,13 +403,16 @@ def run_interactive_mode(pdf_path: str | None = None):
         default_output = f"{company_name} {first_short} - {last_short}.xlsx"
 
         output_input = input(f"\nOutput-fil (Enter för [{default_output}]): ").strip()
-        output_file = output_input if output_input else default_output
+        output_filename = output_input if output_input else default_output
+
+        # Spara databok i bolagets ligger_i_databasen-mapp
+        output_path = get_databook_path(output_filename, company_name, base_folder)
 
         # Bygg Excel
         print("\n📊 Skapar databok...")
-        normalize_tokens = build_databook(data_to_export, output_file)
+        normalize_tokens = build_databook(data_to_export, str(output_path))
 
-        print(f"\n✅ Databok skapad: {output_file}")
+        print(f"\n✅ Databok skapad: {output_path}")
         print(f"   Innehåller {len(data_to_export)} period(er): {', '.join(period_names)}")
 
         if normalize_tokens:
@@ -402,13 +451,16 @@ def run_interactive_mode(pdf_path: str | None = None):
 
                 default_output = f"{company_name} {period_name}.xlsx"
                 output_input = input(f"\nOutput-fil (Enter för [{default_output}]): ").strip()
-                output_file = output_input if output_input else default_output
+                output_filename = output_input if output_input else default_output
+
+                # Spara databok i bolagets ligger_i_databasen-mapp
+                output_path = get_databook_path(output_filename, company_name, base_folder)
 
                 # Bygg Excel
                 print("\n📊 Skapar databok...")
-                normalize_tokens = build_databook(data_to_export, output_file)
+                normalize_tokens = build_databook(data_to_export, str(output_path))
 
-                print(f"\n✅ Databok skapad: {output_file}")
+                print(f"\n✅ Databok skapad: {output_path}")
                 print(f"   Innehåller: {period_name}")
 
                 if normalize_tokens:
@@ -485,12 +537,22 @@ def run_interactive_mode(pdf_path: str | None = None):
 
             on_progress, state, stop_timer = create_progress_tracker([str(path)])
 
+            # Beräkna base_folder för filflyttning
+            # Strukturen är: base_folder/company/skall_extractas/fil.pdf
+            # eller: base_folder/company/fil.pdf
+            if path.parent.name == "skall_extractas":
+                base_folder = str(path.parent.parent.parent)
+            else:
+                base_folder = str(path.parent.parent)
+
             successful, failed = asyncio.run(
                 extract_all_pdfs_multi_pass(
                     [str(path)],
                     company_name,
                     on_progress,
                     use_cache=False,
+                    base_folder=base_folder,
+                    quiet=True,  # Undertryck output - progress-tracker hanterar UI
                 )
             )
             stop_timer()
@@ -577,13 +639,16 @@ def run_interactive_mode(pdf_path: str | None = None):
             default_output = f"{company_name} {first_short} - {last_short}.xlsx"
 
         output_input = input(f"\nOutput-fil (Enter för [{default_output}]): ").strip()
-        output_file = output_input if output_input else default_output
+        output_filename = output_input if output_input else default_output
+
+        # Spara databok i bolagets ligger_i_databasen-mapp
+        output_path = get_databook_path(output_filename, company_name, base_folder)
 
         # Bygg Excel
         print("\n📊 Skapar databok...")
-        normalize_tokens = build_databook(data_to_export, output_file)
+        normalize_tokens = build_databook(data_to_export, str(output_path))
 
-        print(f"\n✅ Databok skapad: {output_file}")
+        print(f"\n✅ Databok skapad: {output_path}")
         print(f"   Innehåller {len(data_to_export)} period(er)")
 
         total_cost = extraction_cost
@@ -641,12 +706,22 @@ def run_interactive_mode(pdf_path: str | None = None):
 
         on_progress, state, stop_timer = create_progress_tracker(pdf_path_strs)
 
+        # Beräkna base_folder för filflyttning
+        # Strukturen är: base_folder/company/skall_extractas/fil.pdf
+        # eller: base_folder/company/fil.pdf
+        if folder_path.name == "skall_extractas":
+            base_folder = str(folder_path.parent.parent)
+        else:
+            base_folder = str(folder_path.parent)
+
         successful, failed = asyncio.run(
             extract_all_pdfs_multi_pass(
                 pdf_path_strs,
                 company_name,
                 on_progress,
                 use_cache=True,
+                base_folder=base_folder,
+                quiet=True,  # Undertryck output - progress-tracker hanterar UI
             )
         )
         stop_timer()
@@ -715,12 +790,15 @@ def run_interactive_mode(pdf_path: str | None = None):
                 default_output = f"{company_name} {first_short} - {last_short}.xlsx"
 
                 output_input = input(f"\nOutput-fil (Enter for [{default_output}]): ").strip()
-                output_file = output_input if output_input else default_output
+                output_filename = output_input if output_input else default_output
+
+                # Spara databok i bolagets ligger_i_databasen-mapp
+                output_path = get_databook_path(output_filename, company_name, base_folder)
 
                 print("\n[~] Skapar databok...")
-                normalize_tokens = build_databook(all_periods_updated, output_file)
+                normalize_tokens = build_databook(all_periods_updated, str(output_path))
 
-                print(f"\n[OK] Databok skapad: {output_file}")
+                print(f"\n[OK] Databok skapad: {output_path}")
                 print(f"   Innehaller {len(all_periods_updated)} period(er)")
 
                 if normalize_tokens:
@@ -879,8 +957,10 @@ Exempel:
                 sys.exit(1)
             print(f"   Filtrerar på: {', '.join(args.period)}")
 
-        normalize_tokens = build_databook(data, args.output)
-        print(f"✅ Databok skapad: {args.output}")
+        # Spara databok i bolagets ligger_i_databasen-mapp
+        output_path = get_databook_path(args.output, args.company)
+        normalize_tokens = build_databook(data, str(output_path))
+        print(f"✅ Databok skapad: {output_path}")
         print(f"   Innehåller {len(data)} period(er)")
 
         # Visa normaliseringskostnad
@@ -918,12 +998,22 @@ Exempel:
 
         # Extrahera nya PDFs
         on_progress, state, stop_timer = create_progress_tracker(add_paths)
+
+        # Beräkna base_folder för filflyttning (baserat på första filen)
+        first_path = Path(add_paths[0])
+        if first_path.parent.name == "skall_extractas":
+            base_folder = str(first_path.parent.parent.parent)
+        else:
+            base_folder = str(first_path.parent.parent)
+
         new_results, failed = asyncio.run(
             extract_all_pdfs_multi_pass(
                 add_paths,
                 args.company,
                 on_progress,
                 use_cache=not args.no_cache,
+                base_folder=base_folder,
+                quiet=True,  # Undertryck output - progress-tracker hanterar UI
             )
         )
         stop_timer()
@@ -943,8 +1033,10 @@ Exempel:
         print(f"\n📈 Totalt {len(all_data)} perioder")
 
         if all_data:
-            normalize_tokens = build_databook(all_data, args.output)
-            print(f"✅ Databok uppdaterad: {args.output}")
+            # Spara databok i bolagets ligger_i_databasen-mapp
+            output_path = get_databook_path(args.output, args.company, base_folder)
+            normalize_tokens = build_databook(all_data, str(output_path))
+            print(f"✅ Databok uppdaterad: {output_path}")
 
             # Visa normaliseringskostnad
             if normalize_tokens:
@@ -989,6 +1081,14 @@ Exempel:
     # Progress tracker
     on_progress, state, stop_timer = create_progress_tracker(pdf_path_strs)
 
+    # Beräkna base_folder för filflyttning
+    # Strukturen är: base_folder/company/skall_extractas/fil.pdf
+    # eller: base_folder/company/fil.pdf
+    if pdf_dir.name == "skall_extractas":
+        base_folder = str(pdf_dir.parent.parent)
+    else:
+        base_folder = str(pdf_dir.parent)
+
     # Kör extraktion (multi-pass är standard)
     print("🔄 Multi-pass pipeline (Haiku → Sonnet → Haiku)")
     successful, failed = asyncio.run(
@@ -997,6 +1097,8 @@ Exempel:
             args.company,
             on_progress,
             use_cache=not args.no_cache,
+            base_folder=base_folder,
+            quiet=True,  # Undertryck output - progress-tracker hanterar UI
         )
     )
     stop_timer()
@@ -1035,8 +1137,10 @@ Exempel:
 
     # Bygg Excel
     if successful:
-        normalize_tokens = build_databook(successful, args.output)
-        print(f"\n📊 Databok skapad: {args.output}")
+        # Spara databok i bolagets ligger_i_databasen-mapp
+        output_path = get_databook_path(args.output, args.company, base_folder)
+        normalize_tokens = build_databook(successful, str(output_path))
+        print(f"\n📊 Databok skapad: {output_path}")
         print(f"   Innehåller {len(successful)} period(er)")
 
         # Visa normaliseringskostnad

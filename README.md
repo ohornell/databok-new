@@ -62,9 +62,10 @@ Optimerad extraktion med tre pass för bästa resultat:
               │                           │
               │                           ▼
               │              ┌─────────────────────┐
-              │              │  Haiku Retry        │
-              │              │  Fixa specifika     │
-              │              │  tabeller ~0.30 kr  │
+              │              │  Sonnet Retry       │
+              │              │  Endast relevanta   │
+              │              │  sidor (pypdf)      │
+              │              │  ~0.20-0.30 kr      │
               │              └──────────┬──────────┘
               │                         │
               └─────────────┬───────────┘
@@ -80,7 +81,7 @@ Optimerad extraktion med tre pass för bästa resultat:
 - **Pass 1**: Haiku skapar strukturkarta över PDF (tabeller, sektioner, grafer)
 - **Pass 2+3**: Körs parallellt - Sonnet extraherar tabeller, Haiku extraherar text
 - **Validering**: Kontrollerar att alla tabeller extraherades korrekt
-- **Retry**: Vid fel körs endast ett Haiku-anrop för att fixa specifika tabeller
+- **Retry**: Vid fel extraheras endast relevanta sidor (±1 sida) med pypdf, sedan körs Sonnet för bättre kvalitet
 - **Embeddings**: Voyage AI genererar vektorer för semantisk sökning
 
 ### Interaktivt läge (`-i`)
@@ -625,4 +626,5 @@ Claude: [söker i kunskapsdatabasen]
 - `supabase` - Supabase Python-klient
 - `python-dotenv` - Miljövariabler
 - `requests` - HTTP-klient för Voyage AI
+- `pypdf` - PDF-sidextraktion för optimerad retry
 - `mcp` - Model Context Protocol
