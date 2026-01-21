@@ -1,10 +1,15 @@
 """
 Validering av extraherad data med automatisk retry vid fel.
 
-Fas 1-valideringar:
+4 HUVUDVALIDERINGAR (jämför Pass 1 struktur med Pass 2 extraktion):
+1. TABELLKOMPLETHET - Finns alla tabeller som identifierades i Pass 1?
+2. RADKOMPLETHET - Har varje tabell minst 80% av row_count_estimate från Pass 1?
+3. KOLUMNKOMPLETHET - Matchar kolumnantal mellan Pass 1 och Pass 2?
+4. DATAKOMPLETHET - Har varje tabell minst 50% icke-null datavärden?
+
+Övriga valideringar (varningar, triggar inte retry):
 - Labels: Kontrollera att radnamn är verklig text (inte "1", "label: 2", etc.)
 - Values-längd: Antal values måste matcha antal columns
-- Tomma tabeller: Varje tabell måste ha minst 1 rad
 """
 
 import re
@@ -163,20 +168,182 @@ def validate_table(table: dict) -> list[ValidationError]:
                     severity="warning"
                 ))
 
+        # Validering 5: Kontrollera att raden har faktiska värden (inte bara null)
+        # Skippa header-rader som ofta saknar värden
+        row_type = row.get("type", "data")
+        if row_type not in ("header",):
+            data_values = values[1:] if values else []  # Exkludera label-kolumnen
+            non_null_count = sum(1 for v in data_values if v is not None)
+            if len(data_values) > 0 and non_null_count == 0:
+                errors.append(ValidationError(
+                    table_id=table_id,
+                    table_title=table_title,
+                    error_type="no_data_values",
+                    message=f"Rad '{label}' har inga numeriska varden (alla null)",
+                    row_index=i,
+                    severity="warning"
+                ))
+
     return errors
 
 
-def validate_tables(tables: list[dict]) -> ValidationResult:
+def validate_tables(tables: list[dict], structure_map: dict | None = None) -> ValidationResult:
     """
-    Validera alla tabeller.
+    Validera alla tabeller mot Pass 1-strukturen.
+
+    4 HUVUDVALIDERINGAR:
+    1. TABELLKOMPLETHET - Finns alla tabeller som identifierades i Pass 1?
+    2. RADKOMPLETHET - Har varje tabell minst 80% av row_count_estimate?
+    3. KOLUMNKOMPLETHET - Matchar kolumnantal mellan Pass 1 och Pass 2?
+    4. DATAKOMPLETHET - Har varje tabell minst 50% icke-null datavärden?
+
+    Args:
+        tables: Lista med extraherade tabeller från Pass 2
+        structure_map: Strukturkarta från Pass 1 (krävs för fullständig validering)
 
     Returnerar ValidationResult med alla fel och varningar.
     """
     all_errors = []
     all_warnings = []
 
+    # Bygg lookup för Pass 1-tabeller
+    pass1_tables = {}
+    if structure_map:
+        for t in structure_map.get("structure_map", {}).get("tables", []):
+            pass1_tables[t["id"]] = t
+
+    # Bygg lookup för extraherade tabeller
+    extracted_table_ids = {t.get("id") for t in tables}
+
+    # ==========================================================================
+    # VALIDERING 1: TABELLKOMPLETHET
+    # Kontrollera att alla tabeller från Pass 1 finns i Pass 2
+    # ==========================================================================
+    for table_id, pass1_table in pass1_tables.items():
+        if table_id not in extracted_table_ids:
+            all_errors.append(ValidationError(
+                table_id=table_id,
+                table_title=pass1_table.get("title", "Okänd"),
+                error_type="missing_table",
+                message=f"Tabell saknas i extraktion (identifierad på sida {pass1_table.get('page', '?')})",
+                severity="error"
+            ))
+
+    # ==========================================================================
+    # VALIDERA VARJE EXTRAHERAD TABELL
+    # ==========================================================================
     for table in tables:
+        table_id = table.get("id", "unknown")
+        table_title = table.get("title", "Okänd tabell")
+        rows = table.get("rows", [])
+        columns = table.get("columns", [])
+
+        # Grundläggande validering (labels, values-längd, etc.)
         errors = validate_table(table)
+
+        # Hämta Pass 1-data om tillgänglig
+        pass1_table = pass1_tables.get(table_id, {})
+
+        # ======================================================================
+        # VALIDERING 2: RADKOMPLETHET
+        # Jämför antal rader med row_count_estimate från Pass 1
+        # ======================================================================
+        expected_rows = pass1_table.get("row_count_estimate")
+        if expected_rows and expected_rows > 0:
+            actual_rows = len(rows)
+            row_ratio = actual_rows / expected_rows
+
+            # Fel om mindre än 80% av förväntade rader
+            if row_ratio < 0.8:
+                errors.append(ValidationError(
+                    table_id=table_id,
+                    table_title=table_title,
+                    error_type="row_count_mismatch",
+                    message=f"Endast {actual_rows} rader extraherade av ~{expected_rows} förväntade ({row_ratio:.0%})",
+                    severity="error"
+                ))
+            # Varning om mellan 80-95%
+            elif row_ratio < 0.95:
+                errors.append(ValidationError(
+                    table_id=table_id,
+                    table_title=table_title,
+                    error_type="row_count_warning",
+                    message=f"{actual_rows} rader extraherade av ~{expected_rows} förväntade ({row_ratio:.0%})",
+                    severity="warning"
+                ))
+
+        # ======================================================================
+        # VALIDERING 3: KOLUMNKOMPLETHET
+        # Jämför kolumnantal med column_headers från Pass 1
+        # ======================================================================
+        expected_columns = pass1_table.get("column_headers", [])
+        if expected_columns and columns:
+            expected_count = len(expected_columns)
+            actual_count = len(columns)
+
+            # Fel om mer än 1 kolumn avvikelse
+            if abs(expected_count - actual_count) > 1:
+                errors.append(ValidationError(
+                    table_id=table_id,
+                    table_title=table_title,
+                    error_type="column_count_mismatch",
+                    message=f"Förväntade {expected_count} kolumner men fick {actual_count}",
+                    severity="error"
+                ))
+            # Varning vid mindre avvikelse
+            elif expected_count != actual_count:
+                errors.append(ValidationError(
+                    table_id=table_id,
+                    table_title=table_title,
+                    error_type="column_count_warning",
+                    message=f"Kolumnantal skiljer: {expected_count} (Pass 1) vs {actual_count} (Pass 2)",
+                    severity="warning"
+                ))
+
+        # ======================================================================
+        # VALIDERING 4: DATAKOMPLETHET
+        # Minst 50% av datacellerna ska ha värden (inte null)
+        # ======================================================================
+        if rows and columns:
+            total_data_cells = 0
+            non_null_cells = 0
+
+            for row in rows:
+                row_type = row.get("type", "data")
+                # Skippa header-rader från datakomplethet
+                if row_type == "header":
+                    continue
+
+                values = row.get("values", [])
+                # Exkludera label-kolumnen (första värdet som alltid är null)
+                data_values = values[1:] if len(values) > 1 else values
+
+                total_data_cells += len(data_values)
+                non_null_cells += sum(1 for v in data_values if v is not None)
+
+            if total_data_cells > 0:
+                data_ratio = non_null_cells / total_data_cells
+
+                # Fel om mindre än 50% data
+                if data_ratio < 0.5:
+                    errors.append(ValidationError(
+                        table_id=table_id,
+                        table_title=table_title,
+                        error_type="data_completeness_error",
+                        message=f"Endast {data_ratio:.0%} dataceller har värden (min 50% krävs)",
+                        severity="error"
+                    ))
+                # Varning om mellan 50-70% data
+                elif data_ratio < 0.7:
+                    errors.append(ValidationError(
+                        table_id=table_id,
+                        table_title=table_title,
+                        error_type="data_completeness_warning",
+                        message=f"{data_ratio:.0%} dataceller har värden",
+                        severity="warning"
+                    ))
+
+        # Sortera fel och varningar
         for error in errors:
             if error.severity == "warning":
                 all_warnings.append(error)
@@ -292,6 +459,26 @@ def get_batched_retry_prompt(tables_with_errors: list[tuple[dict, list[Validatio
                 error_descriptions.append(
                     f"  - Tabellen har inga rader extraherade."
                 )
+            elif error.error_type == "column_count_mismatch":
+                error_descriptions.append(
+                    f"  - KOLUMNFEL: {error.message}. "
+                    f"Las av ALLA kolumnrubriker fran PDF:en noggrant."
+                )
+            elif error.error_type == "no_data_values":
+                error_descriptions.append(
+                    f"  - Rad {error.row_index}: Saknar numeriska varden. "
+                    f"Las av siffrorna fran PDF:en for denna rad."
+                )
+            elif error.error_type == "row_count_mismatch":
+                error_descriptions.append(
+                    f"  - RADFEL: {error.message}. "
+                    f"Las av ALLA rader i tabellen, inklusive underrubriker och summeringsrader."
+                )
+            elif error.error_type == "data_completeness_error":
+                error_descriptions.append(
+                    f"  - DATAFEL: {error.message}. "
+                    f"Las av siffrorna for varje cell i tabellen. Tom cell = null."
+                )
 
         table_prompts.append(f"""
 TABELL {len(table_prompts) + 1}: "{table_title}" (sida {table_page}, id: {table_id})
@@ -391,19 +578,20 @@ def validate_sections(sections: list[dict]) -> ValidationResult:
 
 
 # Convenience-funktion för enkel användning
-def validate_extraction_result(data: dict) -> ValidationResult:
+def validate_extraction_result(data: dict, structure_map: dict | None = None) -> ValidationResult:
     """
     Validera ett komplett extraktionsresultat (tabeller OCH sections).
 
     Args:
         data: Dict med "tables", "sections", etc.
+        structure_map: Strukturkarta från Pass 1 (för kolumnvalidering)
 
     Returns:
         ValidationResult med alla fel och varningar
     """
     # Validera tabeller
     tables = data.get("tables", [])
-    table_result = validate_tables(tables)
+    table_result = validate_tables(tables, structure_map)
 
     # Validera sections
     sections = data.get("sections", [])

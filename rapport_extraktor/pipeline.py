@@ -420,8 +420,8 @@ async def validate_and_retry_with_sonnet(
     """
     current_tables = tables.copy()
 
-    # Steg 1: Validera extraherade tabeller
-    validation_result = validate_tables(current_tables)
+    # Steg 1: Validera extraherade tabeller (inkl. kolumnjämförelse med Pass 1)
+    validation_result = validate_tables(current_tables, structure_map)
     tables_with_errors = validation_result.tables_with_errors
 
     # Steg 2: Hitta saknade tabeller
@@ -627,8 +627,8 @@ KRITISKA REGLER:
             print(f"      [RETRY KLAR] {len(fixed_tables)}/{len(tables_to_fix)} tabeller fixade "
                   f"({elapsed:.1f}s, {input_tokens:,}+{output_tokens:,} tokens, {retry_cost:.2f} SEK)", flush=True)
 
-            # Validera igen
-            final_validation = validate_tables(current_tables)
+            # Validera igen (med struktur för kolumnjämförelse)
+            final_validation = validate_tables(current_tables, structure_map)
 
             retry_stats = {
                 "retry_count": 1,

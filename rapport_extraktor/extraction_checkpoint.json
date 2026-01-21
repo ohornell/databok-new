@@ -1,11 +1,12 @@
 {
   "batch_f367ab00-59f1-4bee-bae5-6cc710174eaa_2026-01-21": {
     "completed": [
-      "C:\\Users\\OskarHörnell\\databok-new\\alla_rapporter\\abgsc\\skall_extractas\\abgsc-2025-q2-en.pdf"
+      "C:\\Users\\OskarHörnell\\databok-new\\alla_rapporter\\abgsc\\skall_extractas\\abgsc-2025-q2-en.pdf",
+      "C:\\Users\\OskarHörnell\\databok-new\\alla_rapporter\\abgsc\\skall_extractas\\abgsc-2025-q3-en.pdf"
     ],
     "failed": [],
-    "last_file": "",
-    "last_update": "2026-01-21T18:18:15.218718",
+    "last_file": "C:\\Users\\OskarHörnell\\databok-new\\alla_rapporter\\abgsc\\skall_extractas\\abgsc-2025-q3-en.pdf",
+    "last_update": "2026-01-21T18:22:55.809342",
     "total_files": 1,
     "batch_started": "2026-01-21T18:18:15.218718"
   }
