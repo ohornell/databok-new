@@ -1,11 +1,12 @@
 """
 Validering av extraherad data med automatisk retry vid fel.
 
-4 HUVUDVALIDERINGAR (jämför Pass 1 struktur med Pass 2 extraktion):
+3 HUVUDVALIDERINGAR (jämför Pass 1 struktur med Pass 2 extraktion):
 1. TABELLKOMPLETHET - Finns alla tabeller som identifierades i Pass 1?
-2. RADKOMPLETHET - Har varje tabell minst 80% av row_count_estimate från Pass 1?
-3. KOLUMNKOMPLETHET - Matchar kolumnantal mellan Pass 1 och Pass 2?
-4. DATAKOMPLETHET - Har varje tabell minst 50% icke-null datavärden?
+2. KOLUMNKOMPLETHET - Matchar kolumnantal mellan Pass 1 och Pass 2?
+3. DATAKOMPLETHET - Har varje tabell minst 50% icke-null datavärden?
+
+OBS: Radkontroll har tagits bort - Haikus row_count_estimate är för opålitligt.
 
 Övriga valideringar (varningar, triggar inte retry):
 - Labels: Kontrollera att radnamn är verklig text (inte "1", "label: 2", etc.)
@@ -191,11 +192,10 @@ def validate_tables(tables: list[dict], structure_map: dict | None = None) -> Va
     """
     Validera alla tabeller mot Pass 1-strukturen.
 
-    4 HUVUDVALIDERINGAR:
+    3 HUVUDVALIDERINGAR:
     1. TABELLKOMPLETHET - Finns alla tabeller som identifierades i Pass 1?
-    2. RADKOMPLETHET - Har varje tabell minst 80% av row_count_estimate?
-    3. KOLUMNKOMPLETHET - Matchar kolumnantal mellan Pass 1 och Pass 2?
-    4. DATAKOMPLETHET - Har varje tabell minst 50% icke-null datavärden?
+    2. KOLUMNKOMPLETHET - Matchar kolumnantal mellan Pass 1 och Pass 2?
+    3. DATAKOMPLETHET - Har varje tabell minst 50% icke-null datavärden?
 
     Args:
         tables: Lista med extraherade tabeller från Pass 2
@@ -245,35 +245,7 @@ def validate_tables(tables: list[dict], structure_map: dict | None = None) -> Va
         pass1_table = pass1_tables.get(table_id, {})
 
         # ======================================================================
-        # VALIDERING 2: RADKOMPLETHET
-        # Jämför antal rader med row_count_estimate från Pass 1
-        # ======================================================================
-        expected_rows = pass1_table.get("row_count_estimate")
-        if expected_rows and expected_rows > 0:
-            actual_rows = len(rows)
-            row_ratio = actual_rows / expected_rows
-
-            # Fel om mindre än 80% av förväntade rader
-            if row_ratio < 0.8:
-                errors.append(ValidationError(
-                    table_id=table_id,
-                    table_title=table_title,
-                    error_type="row_count_mismatch",
-                    message=f"Endast {actual_rows} rader extraherade av ~{expected_rows} förväntade ({row_ratio:.0%})",
-                    severity="error"
-                ))
-            # Varning om mellan 80-95%
-            elif row_ratio < 0.95:
-                errors.append(ValidationError(
-                    table_id=table_id,
-                    table_title=table_title,
-                    error_type="row_count_warning",
-                    message=f"{actual_rows} rader extraherade av ~{expected_rows} förväntade ({row_ratio:.0%})",
-                    severity="warning"
-                ))
-
-        # ======================================================================
-        # VALIDERING 3: KOLUMNKOMPLETHET
+        # VALIDERING 2: KOLUMNKOMPLETHET
         # Jämför kolumnantal med column_headers från Pass 1
         # ======================================================================
         expected_columns = pass1_table.get("column_headers", [])
@@ -301,7 +273,7 @@ def validate_tables(tables: list[dict], structure_map: dict | None = None) -> Va
                 ))
 
         # ======================================================================
-        # VALIDERING 4: DATAKOMPLETHET
+        # VALIDERING 3: DATAKOMPLETHET
         # Minst 50% av datacellerna ska ha värden (inte null)
         # ======================================================================
         if rows and columns:
@@ -468,11 +440,6 @@ def get_batched_retry_prompt(tables_with_errors: list[tuple[dict, list[Validatio
                 error_descriptions.append(
                     f"  - Rad {error.row_index}: Saknar numeriska varden. "
                     f"Las av siffrorna fran PDF:en for denna rad."
-                )
-            elif error.error_type == "row_count_mismatch":
-                error_descriptions.append(
-                    f"  - RADFEL: {error.message}. "
-                    f"Las av ALLA rader i tabellen, inklusive underrubriker och summeringsrader."
                 )
             elif error.error_type == "data_completeness_error":
                 error_descriptions.append(
