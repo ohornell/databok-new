@@ -62,7 +62,7 @@ CREATE TABLE sections (
     page_number INTEGER,
     section_type TEXT,  -- narrative, summary, highlights, other
     content TEXT NOT NULL,
-    embedding vector(1536),  -- För semantisk sökning (OpenAI embedding dimension)
+    embedding vector(1024),  -- För semantisk sökning (Voyage-3 dimension)
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -147,9 +147,82 @@ $$ LANGUAGE plpgsql IMMUTABLE;
 
 -- Kör migrations/002_label_synonyms.sql för att populera synonym-tabellen
 
+-- ============================================
+-- KUNSKAPSDATABAS (RAG)
+-- ============================================
+
+-- Knowledge-tabell för att lagra definitioner, formler, analysmetoder etc.
+CREATE TABLE knowledge (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    domain VARCHAR(50) NOT NULL CHECK (domain IN ('nyckeltal', 'redovisning', 'bransch', 'värdering', 'kvalitativ')),
+    category VARCHAR(200) NOT NULL,  -- t.ex. 'IFRS', 'K3', 'justeringar', 'röda_flaggor'
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    tags TEXT[] DEFAULT '{}',
+    related_metrics TEXT[] DEFAULT '{}',
+    source TEXT,  -- t.ex. 'FAR', 'CFA', 'ESMA', 'intern'
+    embedding vector(1024),  -- Voyage-3 dimension
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Index för knowledge
+CREATE INDEX idx_knowledge_domain ON knowledge(domain);
+CREATE INDEX idx_knowledge_category ON knowledge(category);
+CREATE INDEX idx_knowledge_tags ON knowledge USING gin(tags);
+
+-- Vektor-index för semantisk sökning
+CREATE INDEX idx_knowledge_embedding ON knowledge USING ivfflat (embedding vector_cosine_ops)
+    WITH (lists = 100);
+
+-- Semantisk sökfunktion för knowledge
+CREATE OR REPLACE FUNCTION search_knowledge(
+    query_embedding vector(1024),
+    match_count int DEFAULT 5,
+    domain_filter text DEFAULT NULL,
+    category_filter text DEFAULT NULL
+)
+RETURNS TABLE (
+    id uuid,
+    title text,
+    content text,
+    domain varchar(50),
+    category varchar(200),
+    tags text[],
+    related_metrics text[],
+    similarity float
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        k.id,
+        k.title::text,
+        k.content::text,
+        k.domain,
+        k.category,
+        k.tags,
+        k.related_metrics,
+        1 - (k.embedding <=> query_embedding) as similarity
+    FROM knowledge k
+    WHERE
+        k.embedding IS NOT NULL
+        AND (domain_filter IS NULL OR k.domain = domain_filter)
+        AND (category_filter IS NULL OR k.category = category_filter)
+    ORDER BY k.embedding <=> query_embedding
+    LIMIT match_count;
+END;
+$$;
+
+-- ============================================
+-- ROW LEVEL SECURITY (valfritt)
+-- ============================================
+
 -- Row Level Security (valfritt - aktivera om du vill ha autentisering)
 -- ALTER TABLE companies ENABLE ROW LEVEL SECURITY;
 -- ALTER TABLE periods ENABLE ROW LEVEL SECURITY;
 -- ALTER TABLE financial_data ENABLE ROW LEVEL SECURITY;
 -- ALTER TABLE sections ENABLE ROW LEVEL SECURITY;
 -- ALTER TABLE report_tables ENABLE ROW LEVEL SECURITY;
+-- ALTER TABLE knowledge ENABLE ROW LEVEL SECURITY;

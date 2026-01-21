@@ -917,21 +917,10 @@ async def extract_pdf_multi_pass(
             if attempt < MAX_RETRIES - 1:
                 print(f"\n[VARNING] Fel vid extraktion av {filename}:")
                 print(f"   {type(e).__name__}: {e}")
-                print(f"\n   Retry {attempt + 1}/{MAX_RETRIES}?")
-
-                while True:
-                    answer = input("   Försök igen? [Y/N]: ").strip().upper()
-                    if answer == "Y":
-                        wait_time = 2 ** attempt
-                        print(f"   Väntar {wait_time}s innan retry...")
-                        await asyncio.sleep(wait_time)
-                        break
-                    elif answer == "N":
-                        if progress_callback:
-                            progress_callback(pdf_path, f"failed: {e}", None)
-                        raise
-                    else:
-                        print("   Ange Y eller N")
+                print(f"   Retry {attempt + 1}/{MAX_RETRIES}...")
+                wait_time = 2 ** attempt
+                print(f"   Väntar {wait_time}s innan retry...")
+                await asyncio.sleep(wait_time)
             else:
                 if progress_callback:
                     progress_callback(pdf_path, f"failed: {e}", None)

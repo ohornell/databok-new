@@ -32,8 +32,8 @@ from supabase import create_client, Client
 load_dotenv()
 
 # Voyage API för embeddings
-VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY", "pa-S5CQuQswu6Vhm3uf3L1TFBCmjP36RLaTkpxpzb4gfCZ")
-VOYAGE_MODEL = "voyage-3"
+VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY")
+VOYAGE_MODEL = "voyage-4"
 
 # Supabase-klient
 _client: Client | None = None
@@ -342,6 +342,8 @@ def db_get_sections(company_slug: str, period: str | None = None, section_type: 
 
 def get_query_embedding(text: str) -> list[float] | None:
     """Hämta embedding för en sökfråga via Voyage AI."""
+    if not VOYAGE_API_KEY:
+        return None
     try:
         response = requests.post(
             "https://api.voyageai.com/v1/embeddings",
@@ -507,10 +509,10 @@ def db_search_sections(query: str, company_slug: str | None = None, use_embeddin
     return results
 
 
-def db_compare_periods(company_slug: str, period1: str, period2: str) -> dict:
+def db_compare_periods(company_slug: str, period1: str, period2: str, statement_type: str = "income_statement") -> dict:
     """Jämför två perioder för samma bolag."""
-    data1 = db_get_financials(company_slug, period1, "income_statement")
-    data2 = db_get_financials(company_slug, period2, "income_statement")
+    data1 = db_get_financials(company_slug, period1, statement_type)
+    data2 = db_get_financials(company_slug, period2, statement_type)
 
     if "error" in data1:
         return data1
@@ -779,6 +781,295 @@ def db_compare_companies(
     }
 
 
+# =============================================================================
+# KNOWLEDGE-FUNKTIONER (RAG)
+# =============================================================================
+
+def db_add_knowledge(
+    domain: str,
+    category: str,
+    title: str,
+    content: str,
+    tags: list[str] | None = None,
+    related_metrics: list[str] | None = None,
+    source: str | None = None
+) -> dict:
+    """
+    Lägg till kunskap i knowledge-databasen.
+
+    Args:
+        domain: Huvudområde (nyckeltal, redovisning, bransch, värdering, kvalitativ)
+        category: Underkategori (t.ex. lönsamhet, IFRS, SaaS)
+        title: Rubrik för kunskapsposten
+        content: Innehållet (300-1500 tecken rekommenderat)
+        tags: Nyckelord för sökning
+        related_metrics: Koppling till finansiella mått
+        source: Källa (FAR, CFA, intern, etc.)
+    """
+    client = get_client()
+
+    # Validera domain
+    valid_domains = ["nyckeltal", "redovisning", "bransch", "värdering", "kvalitativ"]
+    if domain not in valid_domains:
+        return {"error": f"Ogiltig domain: {domain}. Giltiga: {valid_domains}"}
+
+    # Skapa embedding för content
+    embedding = None
+    try:
+        text_for_embedding = f"{title}\n\n{content}"
+        embedding = get_query_embedding(text_for_embedding)
+    except Exception as e:
+        # Fortsätt utan embedding om det misslyckas
+        pass
+
+    # Skapa post
+    data = {
+        "domain": domain,
+        "category": category,
+        "title": title,
+        "content": content,
+        "tags": tags or [],
+        "related_metrics": related_metrics or [],
+        "source": source
+    }
+
+    if embedding:
+        data["embedding"] = embedding
+
+    try:
+        result = client.table("knowledge").insert(data).execute()
+
+        if result.data:
+            return {
+                "success": True,
+                "id": result.data[0]["id"],
+                "title": title,
+                "domain": domain,
+                "category": category,
+                "has_embedding": embedding is not None
+            }
+        else:
+            return {"error": "Kunde inte spara kunskapspost"}
+    except Exception as e:
+        return {"error": f"Databasfel: {str(e)}"}
+
+
+def db_search_knowledge(
+    query: str,
+    domain: str | None = None,
+    category: str | None = None,
+    limit: int = 5
+) -> dict:
+    """
+    Sök i knowledge-databasen med semantisk sökning.
+
+    Args:
+        query: Sökfråga
+        domain: Filtrera på domän (valfritt)
+        category: Filtrera på kategori (valfritt)
+        limit: Max antal resultat (default 5)
+    """
+    client = get_client()
+
+    # Skapa embedding för sökfrågan
+    query_embedding = get_query_embedding(query)
+    fallback_reason = None
+
+    if not VOYAGE_API_KEY:
+        fallback_reason = "VOYAGE_API_KEY ej konfigurerad"
+    elif not query_embedding:
+        fallback_reason = "Kunde inte skapa embedding för sökfrågan"
+
+    if query_embedding:
+        # Semantisk sökning via RPC
+        try:
+            result = client.rpc("search_knowledge", {
+                "query_embedding": query_embedding,
+                "match_count": limit,
+                "domain_filter": domain,
+                "category_filter": category
+            }).execute()
+
+            if result.data:
+                return {
+                    "query": query,
+                    "search_type": "semantic",
+                    "results": [{
+                        "title": r["title"],
+                        "content": r["content"],
+                        "domain": r["domain"],
+                        "category": r["category"],
+                        "tags": r["tags"],
+                        "related_metrics": r["related_metrics"],
+                        "similarity": round(r["similarity"], 3)
+                    } for r in result.data]
+                }
+        except Exception as e:
+            fallback_reason = f"RPC-fel: {str(e)}"
+
+    # Fallback: enkel textsökning
+    query_builder = client.table("knowledge").select("*")
+
+    if domain:
+        query_builder = query_builder.eq("domain", domain)
+    if category:
+        query_builder = query_builder.eq("category", category)
+
+    # Sök i title och content - splitta på mellanslag för bättre matchning
+    search_terms = query.replace("/", " ").split()
+    if len(search_terms) > 1:
+        # Sök på varje term separat och kombinera
+        or_conditions = []
+        for term in search_terms[:3]:  # Max 3 termer
+            or_conditions.append(f"title.ilike.%{term}%")
+            or_conditions.append(f"content.ilike.%{term}%")
+        query_builder = query_builder.or_(",".join(or_conditions))
+    else:
+        query_builder = query_builder.or_(f"title.ilike.%{query}%,content.ilike.%{query}%")
+    query_builder = query_builder.limit(limit)
+
+    result = query_builder.execute()
+
+    response = {
+        "query": query,
+        "search_type": "text",
+        "results": [{
+            "title": r["title"],
+            "content": r["content"],
+            "domain": r["domain"],
+            "category": r["category"],
+            "tags": r.get("tags", []),
+            "related_metrics": r.get("related_metrics", [])
+        } for r in result.data]
+    }
+
+    if fallback_reason:
+        response["fallback_reason"] = fallback_reason
+
+    return response
+
+
+def db_list_knowledge(domain: str | None = None, category: str | None = None) -> dict:
+    """Lista all kunskap, med valfri filtrering."""
+    client = get_client()
+
+    query = client.table("knowledge").select("id, domain, category, title, tags, created_at")
+
+    if domain:
+        query = query.eq("domain", domain)
+    if category:
+        query = query.eq("category", category)
+
+    query = query.order("domain").order("category").order("title")
+    result = query.execute()
+
+    # Gruppera per domain/category
+    grouped = {}
+    for r in result.data:
+        key = f"{r['domain']}/{r['category']}"
+        if key not in grouped:
+            grouped[key] = []
+        grouped[key].append({
+            "id": r["id"],
+            "title": r["title"],
+            "tags": r.get("tags", [])
+        })
+
+    return {
+        "total": len(result.data),
+        "by_category": grouped
+    }
+
+
+def db_delete_knowledge(knowledge_id: str) -> dict:
+    """Ta bort en kunskapspost."""
+    client = get_client()
+
+    try:
+        # Kontrollera att posten finns
+        existing = client.table("knowledge").select("id, title").eq("id", knowledge_id).execute()
+        if not existing.data:
+            return {"error": f"Kunskapspost med id '{knowledge_id}' hittades inte"}
+
+        title = existing.data[0]["title"]
+
+        # Ta bort
+        client.table("knowledge").delete().eq("id", knowledge_id).execute()
+
+        return {
+            "success": True,
+            "deleted_id": knowledge_id,
+            "deleted_title": title
+        }
+    except Exception as e:
+        return {"error": f"Kunde inte ta bort: {str(e)}"}
+
+
+def db_update_knowledge(
+    knowledge_id: str,
+    title: str | None = None,
+    content: str | None = None,
+    category: str | None = None,
+    tags: list[str] | None = None,
+    related_metrics: list[str] | None = None,
+    source: str | None = None
+) -> dict:
+    """Uppdatera en kunskapspost."""
+    client = get_client()
+
+    try:
+        # Kontrollera att posten finns
+        existing = client.table("knowledge").select("*").eq("id", knowledge_id).execute()
+        if not existing.data:
+            return {"error": f"Kunskapspost med id '{knowledge_id}' hittades inte"}
+
+        # Bygg uppdatering
+        updates = {}
+        if title is not None:
+            updates["title"] = title
+        if content is not None:
+            updates["content"] = content
+        if category is not None:
+            updates["category"] = category
+        if tags is not None:
+            updates["tags"] = tags
+        if related_metrics is not None:
+            updates["related_metrics"] = related_metrics
+        if source is not None:
+            updates["source"] = source
+
+        if not updates:
+            return {"error": "Inga fält att uppdatera"}
+
+        # Uppdatera embedding om title eller content ändrats
+        if title is not None or content is not None:
+            new_title = title or existing.data[0]["title"]
+            new_content = content or existing.data[0]["content"]
+            try:
+                embedding = get_query_embedding(f"{new_title}\n\n{new_content}")
+                if embedding:
+                    updates["embedding"] = embedding
+            except Exception:
+                pass
+
+        updates["updated_at"] = "now()"
+
+        # Utför uppdatering
+        result = client.table("knowledge").update(updates).eq("id", knowledge_id).execute()
+
+        if result.data:
+            return {
+                "success": True,
+                "id": knowledge_id,
+                "updated_fields": list(updates.keys())
+            }
+        else:
+            return {"error": "Uppdatering misslyckades"}
+
+    except Exception as e:
+        return {"error": f"Kunde inte uppdatera: {str(e)}"}
+
+
 def db_get_charts(company_slug: str, period: str | None = None) -> dict:
     """Hämta grafer/diagram för en period."""
     client = get_client()
@@ -993,6 +1284,11 @@ async def list_tools() -> list[Tool]:
                     "period2": {
                         "type": "string",
                         "description": "Andra perioden, t.ex. 'Q3 2023'"
+                    },
+                    "statement_type": {
+                        "type": "string",
+                        "enum": ["income_statement", "balance_sheet", "cash_flow"],
+                        "description": "Typ av rapport att jämföra. Default: income_statement"
                     }
                 },
                 "required": ["company", "period1", "period2"]
@@ -1046,6 +1342,148 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["company1", "company2"]
             }
+        ),
+        # Knowledge-verktyg
+        Tool(
+            name="add_knowledge",
+            description="Lägg till kunskap i kunskapsdatabasen. Använd för att spara definitioner, formler, analysmetoder och best practices.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "domain": {
+                        "type": "string",
+                        "enum": ["nyckeltal", "redovisning", "bransch", "värdering", "kvalitativ"],
+                        "description": "Huvudområde för kunskapen"
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Underkategori, t.ex. 'lönsamhet', 'IFRS', 'SaaS', 'röda_flaggor'"
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Rubrik för kunskapsposten"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Innehållet (300-1500 tecken rekommenderat). Inkludera formler, definitioner, typiska värden, tolkningsguide."
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Nyckelord för sökning"
+                    },
+                    "related_metrics": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Relaterade finansiella mått (t.ex. 'EBITDA', 'Nettoomsättning')"
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "Källa (t.ex. 'FAR', 'CFA', 'intern')"
+                    }
+                },
+                "required": ["domain", "category", "title", "content"]
+            }
+        ),
+        Tool(
+            name="search_knowledge",
+            description="Sök i kunskapsdatabasen efter definitioner, formler, analysmetoder och best practices. Använder semantisk sökning.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Sökfråga, t.ex. 'hur beräknas EBITDA-marginal' eller 'röda flaggor kassaflöde'"
+                    },
+                    "domain": {
+                        "type": "string",
+                        "enum": ["nyckeltal", "redovisning", "bransch", "värdering", "kvalitativ"],
+                        "description": "Filtrera på domän (valfritt)"
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Filtrera på kategori (valfritt)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max antal resultat (default 5)"
+                    }
+                },
+                "required": ["query"]
+            }
+        ),
+        Tool(
+            name="list_knowledge",
+            description="Lista all kunskap i databasen, grupperat per domän och kategori.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "domain": {
+                        "type": "string",
+                        "enum": ["nyckeltal", "redovisning", "bransch", "värdering", "kvalitativ"],
+                        "description": "Filtrera på domän (valfritt)"
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Filtrera på kategori (valfritt)"
+                    }
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="delete_knowledge",
+            description="Ta bort en kunskapspost från databasen.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "UUID för kunskapsposten att ta bort (från list_knowledge)"
+                    }
+                },
+                "required": ["id"]
+            }
+        ),
+        Tool(
+            name="update_knowledge",
+            description="Uppdatera en befintlig kunskapspost. Embedding uppdateras automatiskt om title eller content ändras.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "UUID för kunskapsposten att uppdatera"
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Ny rubrik (valfritt)"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Nytt innehåll (valfritt)"
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Ny kategori (valfritt)"
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Nya taggar (valfritt)"
+                    },
+                    "related_metrics": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Nya relaterade mått (valfritt)"
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "Ny källa (valfritt)"
+                    }
+                },
+                "required": ["id"]
+            }
         )
     ]
 
@@ -1055,13 +1493,18 @@ async def list_prompts() -> list[Prompt]:
     """Definiera tillgängliga prompts."""
     return [
         Prompt(
-            name="welcome",
-            description="Välkomstmeddelande som förklarar vad MCP:n kan göra",
+            name="verktyg",
+            description="Tillgängliga verktyg",
             arguments=[]
         ),
         Prompt(
-            name="search_guide",
-            description="Guide för hur sökning fungerar",
+            name="dataset",
+            description="Tillgängliga dataset",
+            arguments=[]
+        ),
+        Prompt(
+            name="funktionalitet",
+            description="Funktionalitet",
             arguments=[]
         )
     ]
@@ -1070,83 +1513,126 @@ async def list_prompts() -> list[Prompt]:
 @server.get_prompt()
 async def get_prompt(name: str, arguments: dict[str, str] | None = None) -> GetPromptResult:
     """Hämta en prompt."""
-    if name == "welcome":
+    if name == "verktyg":
         return GetPromptResult(
-            description="Välkomstmeddelande för Rapport Extraktor",
+            description="Tillgängliga verktyg",
             messages=[PromptMessage(
                 role="user",
                 content=TextContent(
                     type="text",
-                    text="""# Rapport Extraktor MCP
+                    text="""Visa följande information direkt i chatten (inte som sammanfattning):
 
-Jag har tillgång till en databas med finansiella rapporter. Här är vad jag kan hjälpa dig med:
+# Tillgängliga verktyg
 
-## Tillgängliga verktyg
-
+## Finansiell data
 | Verktyg | Beskrivning |
 |---------|-------------|
 | `list_companies` | Lista alla bolag i databasen |
 | `get_periods` | Visa tillgängliga kvartal för ett bolag |
-| `get_financials` | Hämta resultat/balans/kassaflöde |
-| `get_kpis` | Hämta nyckeltal (marginaler, tillväxt) |
-| `get_sections` | Hämta textsektioner (VD-kommentar, etc.) |
-| `search_sections` | Sök i alla textsektioner (hybrid: text + AI) |
-| `compare_periods` | Jämför två perioder |
+| `get_financials` | Hämta resultaträkning, balansräkning eller kassaflödesanalys |
+| `get_kpis` | Hämta nyckeltal (marginaler, tillväxt, etc.) |
+| `get_sections` | Hämta textsektioner (VD-ord, marknadsöversikt, etc.) |
 | `get_charts` | Hämta extraherade grafer med datapunkter |
+| `search_sections` | Sök i textsektioner (hybrid: text + semantisk AI-sökning) |
+| `compare_periods` | Jämför två perioder för samma bolag |
+| `compare_companies` | Jämför två bolag (stödjer cross-language) |
 
-## Exempel på frågor
+## Kunskapsdatabas (RAG)
+| Verktyg | Beskrivning |
+|---------|-------------|
+| `search_knowledge` | Sök efter definitioner, formler och analysmetoder |
+| `add_knowledge` | Lägg till ny kunskap (definitioner, formler, best practices) |
+| `list_knowledge` | Lista all kunskap grupperat per domän/kategori |
+| `update_knowledge` | Uppdatera befintlig kunskapspost |
+| `delete_knowledge` | Ta bort kunskapspost |
 
-- "Vilka bolag finns i databasen?"
+## Användning
+
+Ställ frågor på naturligt språk, t.ex.:
 - "Visa Vitrolifes resultaträkning för Q3 2024"
-- "Sök efter information om tillväxt"
-- "Jämför Q3 2024 med Q3 2023 för Vitrolife"
-- "Vad säger VD:n i senaste rapporten?"
+- "Sök efter information om förvärv"
+- "Hur beräknas EBITDA-marginal?"
+- "Lägg till kunskap om Rule of 40"
 
-## Källhänvisningar
-
-All data inkluderar källhänvisningar (PDF-fil, period, sidnummer) för spårbarhet.
-
-Vad vill du veta?"""
+All data inkluderar källhänvisningar (PDF-fil, period, sidnummer)."""
                 )
             )]
         )
 
-    elif name == "search_guide":
+    elif name == "dataset":
         return GetPromptResult(
-            description="Guide för sökning i rapporter",
+            description="Tillgängliga dataset",
             messages=[PromptMessage(
                 role="user",
                 content=TextContent(
                     type="text",
-                    text="""# Sökguide
+                    text="""Visa följande information direkt i chatten (inte som sammanfattning):
 
-## Sökmetoder
+# Tillgängliga dataset
 
-När du söker använder jag **hybrid sökning** som kombinerar:
-- **Textsökning** (30%): Hittar exakta ordmatchningar
-- **Semantisk sökning** (70%): Förstår betydelse och kontext med AI
+Databasen innehåller extraherad data från kvartalsrapporter.
 
-## Så här fungerar det
+## Datatyper per rapport
 
-1. Du ställer en fråga, t.ex. "Sök efter lönsamhetsförbättringar"
-2. Jag genererar en AI-embedding för din fråga
-3. Söker både på exakta ord OCH liknande begrepp
-4. Returnerar de mest relevanta resultaten med poäng
+| Typ | Beskrivning |
+|-----|-------------|
+| **Finansiella tabeller** | Resultaträkning, balansräkning, kassaflödesanalys |
+| **Nyckeltal (KPIs)** | Marginaler, tillväxt, lönsamhet |
+| **Textsektioner** | VD-ord, marknadsöversikt, verksamhetsbeskrivning |
+| **Övriga tabeller** | Segmentdata, produktfördelning, geografisk fördelning |
+| **Grafer** | Extraherade diagram med uppskattade datapunkter |
 
-## Tips för bättre sökningar
+## Metadata
 
-- Använd beskrivande fraser: "tillväxtstrategi" istället för "tillväxt"
-- Kombinera bolagsnamn + ämne: "Vitrolife förvärv"
-- Semantisk sökning förstår synonymer: "vinst" hittar även "resultat"
+Varje datapunkt inkluderar:
+- Bolag och period (Q1-Q4 + år)
+- Källfil (PDF-namn)
+- Sidnummer (för sektioner och tabeller)
+- Valuta (SEK, NOK, EUR, etc.)
+- Språk (sv, no, en)
 
-## Resultatformat
+## Sökning
 
-Varje resultat visar:
-- Bolag och period
-- Sektion och sidnummer
-- Relevanspoäng (0-1)
-- Sökmetod (hybrid/semantic/text)
-- Källfil för spårbarhet"""
+Textsektioner har semantiska embeddings (Voyage AI) för intelligent sökning som förstår synonymer och kontext."""
+                )
+            )]
+        )
+
+    elif name == "funktionalitet":
+        return GetPromptResult(
+            description="Funktionalitet",
+            messages=[PromptMessage(
+                role="user",
+                content=TextContent(
+                    type="text",
+                    text="""Visa följande information direkt i chatten (inte som sammanfattning):
+
+# Funktionalitet
+
+## Vad kan jag hjälpa dig med?
+
+### Analys
+- Hämta finansiell data för specifika bolag och perioder
+- Jämföra perioder (t.ex. Q3 2024 vs Q3 2023)
+- Jämföra bolag (stödjer cross-language, t.ex. svenskt vs norskt bolag)
+- Söka efter specifik information i rapporttexter
+
+### Sökning
+Hybrid sökning kombinerar:
+- **Textsökning** (30%): Exakta ordmatchningar
+- **Semantisk sökning** (70%): AI som förstår betydelse och kontext
+
+Tips: Sök på beskrivande fraser som "lönsamhetsförbättring" eller "förvärvsstrategi"
+
+### Exempel på frågor
+- "Vilka bolag finns i databasen?"
+- "Hur har Vitrolifes omsättning utvecklats senaste året?"
+- "Vad säger VD:n om framtidsutsikterna?"
+- "Sök efter information om hållbarhet"
+- "Jämför marginaler mellan Q2 och Q3 2024"
+
+### Källhänvisningar
+All data inkluderar spårbarhet till ursprunglig PDF, period och sidnummer."""
                 )
             )]
         )
@@ -1199,7 +1685,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             result = db_compare_periods(
                 arguments["company"],
                 arguments["period1"],
-                arguments["period2"]
+                arguments["period2"],
+                arguments.get("statement_type", "income_statement")
             )
         
         elif name == "get_charts":
@@ -1215,6 +1702,46 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 arguments.get("period1"),
                 arguments.get("period2"),
                 arguments.get("statement_type", "income_statement")
+            )
+
+        # Knowledge-verktyg
+        elif name == "add_knowledge":
+            result = db_add_knowledge(
+                domain=arguments["domain"],
+                category=arguments["category"],
+                title=arguments["title"],
+                content=arguments["content"],
+                tags=arguments.get("tags"),
+                related_metrics=arguments.get("related_metrics"),
+                source=arguments.get("source")
+            )
+
+        elif name == "search_knowledge":
+            result = db_search_knowledge(
+                query=arguments["query"],
+                domain=arguments.get("domain"),
+                category=arguments.get("category"),
+                limit=arguments.get("limit", 5)
+            )
+
+        elif name == "list_knowledge":
+            result = db_list_knowledge(
+                domain=arguments.get("domain"),
+                category=arguments.get("category")
+            )
+
+        elif name == "delete_knowledge":
+            result = db_delete_knowledge(arguments["id"])
+
+        elif name == "update_knowledge":
+            result = db_update_knowledge(
+                knowledge_id=arguments["id"],
+                title=arguments.get("title"),
+                content=arguments.get("content"),
+                category=arguments.get("category"),
+                tags=arguments.get("tags"),
+                related_metrics=arguments.get("related_metrics"),
+                source=arguments.get("source")
             )
 
         else:

@@ -14,6 +14,19 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
+def sanitize_sheet_name(name: str) -> str:
+    """Sanera fliknamn för Excel (tar bort ogiltiga tecken)."""
+    if not name:
+        return "Sheet"
+    # Excel tillåter inte: / \ * ? : [ ]
+    invalid_chars = r'[/\\*?:\[\]]'
+    sanitized = re.sub(invalid_chars, ' ', name)
+    # Ta bort dubbla mellanslag
+    sanitized = re.sub(r'\s+', ' ', sanitized).strip()
+    # Max 31 tecken
+    return sanitized[:31]
+
+
 def normalize_row_name(name: str) -> str:
     """Normalisera radnamn för matchning mellan perioder."""
     if not name:
@@ -1245,8 +1258,8 @@ def build_databook(extracted_data: list[dict], output_path: str) -> dict | None:
             create_separator_sheet(wb, "═ TEXT ═")
 
             for page, section_title in sections_with_page:
-                # Korta ner bladnamn till max 31 tecken (Excel-begränsning)
-                sheet_name = section_title[:31]
+                # Sanera fliknamn (tar bort ogiltiga tecken och kortar till 31)
+                sheet_name = sanitize_sheet_name(section_title)
                 # Undvik duplicerade bladnamn
                 existing_sheets = [ws.title for ws in wb.worksheets]
                 if sheet_name not in existing_sheets:

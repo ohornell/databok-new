@@ -10,12 +10,16 @@ import requests
 from supabase import create_client
 
 # Voyage API
-VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY", "pa-S5CQuQswu6Vhm3uf3L1TFBCmjP36RLaTkpxpzb4gfCZ")
-VOYAGE_MODEL = "voyage-3"  # 1024 dimensioner, bra balans kvalitet/kostnad
+VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY")
+if not VOYAGE_API_KEY:
+    raise ValueError("VOYAGE_API_KEY måste vara satt i miljövariabler")
+VOYAGE_MODEL = "voyage-4"  # 1024 dimensioner, bra balans kvalitet/kostnad
 
 # Supabase
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://zgynsljvyympqiengxyp.supabase.co")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "sb_publishable_Y2IvRKczw9afOobEeXRgww_PZxOs9kl")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise ValueError("SUPABASE_URL och SUPABASE_KEY måste vara satta i miljövariabler")
 
 
 def get_voyage_embeddings(texts: list[str], max_retries: int = 5) -> list[list[float]]:

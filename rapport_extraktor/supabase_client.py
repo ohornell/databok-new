@@ -20,8 +20,8 @@ load_dotenv()
 _client: Client | None = None
 
 # Voyage API för embeddings
-VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY", "pa-S5CQuQswu6Vhm3uf3L1TFBCmjP36RLaTkpxpzb4gfCZ")
-VOYAGE_MODEL = "voyage-3"
+VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY")
+VOYAGE_MODEL = "voyage-4"
 
 
 def get_client() -> Client:
@@ -270,8 +270,9 @@ def save_period(company_id: str, data: dict, pdf_hash: str | None = None, source
     if charts:
         try:
             save_charts(period_id, charts)
-        except Exception:
-            pass  # charts-tabellen finns inte ännu
+        except Exception as e:
+            # Logga specifikt fel istället för att tysta det
+            print(f"   [VARNING] Kunde inte spara grafer: {e}")
 
     # Generera embeddings för sections automatiskt
     if section_ids:
@@ -361,8 +362,10 @@ def load_period(company_id: str, quarter: int, year: int) -> dict | None:
                     "estimated": c["estimated"],
                     "data_points": c["data_points"] or []
                 })
-        except Exception:
-            pass  # charts-tabellen finns inte ännu
+        except Exception as e:
+            # Tysta bara om det är PostgrestAPIError (tabell saknas), logga övriga fel
+            if "relation" not in str(e).lower() and "does not exist" not in str(e).lower():
+                print(f"   [VARNING] Kunde inte ladda grafer: {e}")
     else:
         # Legacy-format
         result["resultatrakning"] = []
