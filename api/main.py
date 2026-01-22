@@ -46,7 +46,7 @@ env_path = Path(__file__).parent.parent / "rapport_extraktor" / ".env"
 load_dotenv(env_path)
 
 from pipeline import extract_pdf_multi_pass
-from pipeline_mistral import extract_pdf_multi_pass_mistral, get_mistral_client
+from pipeline_mistral_v2 import extract_pdf_mistral_v2, get_mistral_client
 from excel_builder import build_databook
 from supabase_client import (
     get_or_create_company,
@@ -351,7 +351,7 @@ async def run_extraction(job_id: str, pdf_path: str, company_name: str, filename
                 raise ValueError("MISTRAL_API_KEY saknas")
 
             client = get_mistral_client()
-            result = await extract_pdf_multi_pass_mistral(
+            result = await extract_pdf_mistral_v2(
                 pdf_path=pdf_path,
                 client=client,
                 semaphore=semaphore,

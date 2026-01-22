@@ -32,8 +32,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from pipeline import extract_all_pdfs_multi_pass
-from pipeline_mistral import extract_pdf_multi_pass_mistral, get_mistral_client
-from pipeline_mistral_v2 import extract_pdf_mistral_v2, get_mistral_client as get_mistral_client_v2
+from pipeline_mistral_v2 import extract_pdf_mistral_v2, get_mistral_client
 from excel_builder import build_databook
 from supabase_client import list_companies, get_or_create_company, slugify, check_database_setup, load_all_periods
 from logger import setup_logger, get_logger
@@ -61,7 +60,8 @@ async def extract_all_pdfs_mistral(
     batch_size: int = 5,
 ) -> tuple[list[dict], list[tuple[str, str]]]:
     """
-    Wrapper för Mistral-pipelinen med checkpoint-stöd.
+    Wrapper för Mistral v2-pipelinen med checkpoint-stöd.
+    Snabbare än v1 - kringgår 8-sidorsbegränsningen.
 
     Args:
         pdf_paths: Lista med PDF-sökvägar
@@ -92,97 +92,12 @@ async def extract_all_pdfs_mistral(
             logger.info(f"[CHECKPOINT] Återupptar batch - hoppar över {original_count - len(pdf_paths)} redan extraherade")
 
     client = get_mistral_client()
-    semaphore = asyncio.Semaphore(2)  # Max 2 parallella anrop
-
-    successful = []
-    failed = []
-
-    logger.info(f"[BATCH] Startar extraktion av {len(pdf_paths)} PDFs med Mistral v1")
-
-    for i, pdf_path in enumerate(pdf_paths):
-        try:
-            result = await extract_pdf_multi_pass_mistral(
-                pdf_path=pdf_path,
-                client=client,
-                semaphore=semaphore,
-                company_id=company["id"],
-                company_name=company_name,
-                progress_callback=progress_callback,
-                use_cache=use_cache,
-                base_folder=base_folder,
-                quiet=quiet,
-            )
-            successful.append(result)
-            add_completed_file(batch_id, str(pdf_path))
-            logger.info(f"[BATCH] {i+1}/{len(pdf_paths)} klar: {Path(pdf_path).name}")
-        except Exception as e:
-            failed.append((pdf_path, str(e)))
-            add_failed_file(batch_id, str(pdf_path), str(e))
-            logger.error(f"[BATCH] {i+1}/{len(pdf_paths)} FEL: {Path(pdf_path).name} - {e}")
-            if progress_callback:
-                progress_callback(pdf_path, f"failed: {e}", None)
-
-        # Minnesrensning var 5:e fil
-        if (i + 1) % batch_size == 0:
-            gc.collect()
-
-    # Spara slutlig checkpoint
-    save_checkpoint(batch_id, [str(p) for p in pdf_paths if any(r.get("_source_file") == str(p) for r in successful)],
-                   [{"path": p, "error": e} for p, e in failed], len(pdf_paths))
-
-    logger.info(f"[BATCH] Klart! {len(successful)} lyckade, {len(failed)} misslyckade")
-    return successful, failed
-
-
-async def extract_all_pdfs_mistral_v2(
-    pdf_paths: list[str],
-    company_name: str,
-    progress_callback=None,
-    use_cache: bool = True,
-    base_folder: str | None = None,
-    quiet: bool = False,
-    resume: bool = False,
-    batch_size: int = 5,
-) -> tuple[list[dict], list[tuple[str, str]]]:
-    """
-    Wrapper för Mistral v2-pipelinen med checkpoint-stöd.
-    Snabbare än v1 - kringgår 8-sidorsbegränsningen.
-
-    Args:
-        pdf_paths: Lista med PDF-sökvägar
-        company_name: Bolagsnamn
-        progress_callback: Callback för progress-uppdateringar
-        use_cache: Använd cache om PDF redan extraherats
-        base_folder: Basmapp för fillagring
-        quiet: Undertryck utskrifter
-        resume: Återuppta från checkpoint om True
-        batch_size: Antal PDFs per batch
-    """
-    from supabase_client import get_or_create_company
-
-    company = get_or_create_company(company_name)
-    logger = get_logger('batch_mistral_v2')
-
-    # Setup logger om base_folder finns
-    if base_folder:
-        setup_logger(company_name, base_folder)
-
-    # Checkpoint-hantering
-    batch_id = generate_batch_id(company["id"])
-    if resume:
-        completed = get_completed_files(batch_id)
-        original_count = len(pdf_paths)
-        pdf_paths = [p for p in pdf_paths if str(p) not in completed]
-        if original_count != len(pdf_paths):
-            logger.info(f"[CHECKPOINT] Återupptar batch - hoppar över {original_count - len(pdf_paths)} redan extraherade")
-
-    client = get_mistral_client_v2()
     semaphore = asyncio.Semaphore(2)  # Max 2 parallella PDFs
 
     successful = []
     failed = []
 
-    logger.info(f"[BATCH] Startar extraktion av {len(pdf_paths)} PDFs med Mistral v2")
+    logger.info(f"[BATCH] Startar extraktion av {len(pdf_paths)} PDFs med Mistral")
 
     for i, pdf_path in enumerate(pdf_paths):
         try:
@@ -575,14 +490,11 @@ def run_interactive_mode(pdf_path: str | None = None, model: str = "claude"):
     # === VÄLJ PIPELINE (endast för extraktion) ===
     if mode_choice in ("3", "4"):
         print("\nVälj extraktionsmodell:")
-        print("   1) Claude (Haiku + Sonnet + Haiku) - Standard")
-        print("   2) Mistral (OCR + Mistral Large)")
-        print("   3) Mistral v2 (OCR + Pixtral) - Snabbast!")
+        print("   1) Claude (Haiku + Sonnet + Haiku)")
+        print("   2) Mistral (OCR + Pixtral) - Snabbast!")
         pipeline_choice = input("\n> ").strip()
         if pipeline_choice == "2":
             model = "mistral"
-        elif pipeline_choice == "3":
-            model = "mistral_v2"
         else:
             model = "claude"
 
@@ -698,9 +610,7 @@ def run_interactive_mode(pdf_path: str | None = None, model: str = "claude"):
 
         # Visa vilken pipeline som används
         if model == "mistral":
-            print("\nAnvänder Mistral pipeline (OCR + Mistral Large)")
-        elif model == "mistral_v2":
-            print("\nAnvänder Mistral v2 pipeline (OCR + Pixtral)")
+            print("\nAnvänder Mistral pipeline (OCR + Pixtral)")
         else:
             print("\nAnvänder Claude pipeline (Haiku + Sonnet + Haiku)")
 
@@ -756,17 +666,6 @@ def run_interactive_mode(pdf_path: str | None = None, model: str = "claude"):
             if model == "mistral":
                 successful, failed = asyncio.run(
                     extract_all_pdfs_mistral(
-                        [str(path)],
-                        company_name,
-                        on_progress,
-                        use_cache=False,
-                        base_folder=base_folder,
-                        quiet=True,
-                    )
-                )
-            elif model == "mistral_v2":
-                successful, failed = asyncio.run(
-                    extract_all_pdfs_mistral_v2(
                         [str(path)],
                         company_name,
                         on_progress,
@@ -935,8 +834,6 @@ def run_interactive_mode(pdf_path: str | None = None, model: str = "claude"):
         # Extraktion
         if model == "mistral":
             print("\n[~] Startar batch-extraktion (Mistral)...\n")
-        elif model == "mistral_v2":
-            print("\n[~] Startar batch-extraktion (Mistral v2)...\n")
         else:
             print("\n[~] Startar batch-extraktion (Claude)...\n")
 
@@ -953,17 +850,6 @@ def run_interactive_mode(pdf_path: str | None = None, model: str = "claude"):
         if model == "mistral":
             successful, failed = asyncio.run(
                 extract_all_pdfs_mistral(
-                    pdf_path_strs,
-                    company_name,
-                    on_progress,
-                    use_cache=True,
-                    base_folder=base_folder,
-                    quiet=True,
-                )
-            )
-        elif model == "mistral_v2":
-            successful, failed = asyncio.run(
-                extract_all_pdfs_mistral_v2(
                     pdf_path_strs,
                     company_name,
                     on_progress,
@@ -1148,9 +1034,9 @@ Exempel:
     )
     parser.add_argument(
         "--model", "-m",
-        choices=["claude", "mistral", "mistral_v2"],
+        choices=["claude", "mistral"],
         default="claude",
-        help="Välj AI-modell för extraktion: claude (default), mistral, eller mistral_v2 (snabbast)"
+        help="Välj AI-modell: claude (default) eller mistral (OCR + Pixtral)"
     )
 
     args = parser.parse_args()
@@ -1282,17 +1168,6 @@ Exempel:
                     quiet=True,
                 )
             )
-        elif args.model == "mistral_v2":
-            new_results, failed = asyncio.run(
-                extract_all_pdfs_mistral_v2(
-                    add_paths,
-                    args.company,
-                    on_progress,
-                    use_cache=not args.no_cache,
-                    base_folder=base_folder,
-                    quiet=True,
-                )
-            )
         else:
             new_results, failed = asyncio.run(
                 extract_all_pdfs_multi_pass(
@@ -1379,21 +1254,9 @@ Exempel:
 
     # Kör extraktion
     if args.model == "mistral":
-        print("🔄 Mistral pipeline (OCR → Mistral Large)")
+        print("🔄 Mistral pipeline (OCR + Pixtral)")
         successful, failed = asyncio.run(
             extract_all_pdfs_mistral(
-                pdf_path_strs,
-                args.company,
-                on_progress,
-                use_cache=not args.no_cache,
-                base_folder=base_folder,
-                quiet=True,
-            )
-        )
-    elif args.model == "mistral_v2":
-        print("🔄 Mistral v2 pipeline (OCR + Pixtral)")
-        successful, failed = asyncio.run(
-            extract_all_pdfs_mistral_v2(
                 pdf_path_strs,
                 args.company,
                 on_progress,

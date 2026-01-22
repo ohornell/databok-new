@@ -1047,3 +1047,48 @@ async def generate_embeddings_for_sections_async(section_ids: list[str]) -> int:
         generate_embeddings_for_sections,
         section_ids
     )
+
+
+# ============================================
+# LOGGNING TILL SUPABASE
+# ============================================
+
+def log_to_supabase(
+    log_level: str,
+    module: str,
+    message: str,
+    period_id: str | None = None,
+    company_id: str | None = None,
+    metadata: dict | None = None,
+) -> None:
+    """
+    Spara loggmeddelande till Supabase extraction_logs tabell.
+
+    Args:
+        log_level: Loggnivå (DEBUG, INFO, WARNING, ERROR)
+        module: Modulnamn (pipeline_mistral_v2, pixtral, etc.)
+        message: Loggmeddelande
+        period_id: UUID för perioden (valfritt)
+        company_id: UUID för bolaget (valfritt)
+        metadata: Extra data som JSONB (valfritt)
+    """
+    try:
+        client = get_client()
+
+        data = {
+            "log_level": log_level,
+            "module": module,
+            "message": message[:2000],  # Begränsa meddelande-längd
+        }
+
+        if period_id:
+            data["period_id"] = period_id
+        if company_id:
+            data["company_id"] = company_id
+        if metadata:
+            data["metadata"] = metadata
+
+        client.table("extraction_logs").insert(data).execute()
+    except Exception:
+        # Ignorera fel - loggning ska inte krascha applikationen
+        pass

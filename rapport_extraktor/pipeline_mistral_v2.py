@@ -51,7 +51,7 @@ from logger import (
 )
 
 # Mistral Modell-IDs
-MISTRAL_OCR = "mistral-ocr-latest"
+MISTRAL_OCR = "mistral-ocr-2512"
 
 # Konfiguration
 MAX_RETRIES = 3
@@ -1205,23 +1205,10 @@ async def extract_pdf_mistral_v2(
             pixtral_elapsed = time.perf_counter() - pixtral_start
             logger.info(f"[PIXTRAL] Grafanalys klar: {pixtral_elapsed:.1f}s")
 
-        # === STEG 5: SPARA GRAFER ===
+        # === STEG 5: FÖRBERED GRAFER (sparas senare efter period_id finns) ===
         period = sammanfogat["metadata"].get("period", "")
-        charts_with_paths = []
-
-        for chart in sammanfogat.get("charts", []):
-            image_path = spara_graf(
-                chart=chart,
-                company_slug=company_slug,
-                period=period,
-                period_id="",  # Sätts efter save_period_atomic_async
-                base_folder=base_folder or "alla_rapporter",
-            )
-            chart_copy = chart.copy()
-            chart_copy["image_path"] = image_path
-            # Ta bort base64 för att spara minne
-            chart_copy.pop("image_base64", None)
-            charts_with_paths.append(chart_copy)
+        # Behåll charts med image_base64 för nu - sparas i steg 7b
+        charts_to_save = sammanfogat.get("charts", [])
 
         # === STEG 6: BYGG OUTPUT ===
         total_elapsed = time.perf_counter() - extraction_start
@@ -1230,7 +1217,7 @@ async def extract_pdf_mistral_v2(
             "metadata": sammanfogat["metadata"],
             "tables": sammanfogat["tables"],
             "sections": sammanfogat["sections"],
-            "charts": charts_with_paths,
+            "charts": [],  # Sätts i steg 7b efter period_id finns
             "_source_file": str(pdf_path),
             "_pipeline_info": {
                 "pipeline": "mistral-v2-annotations",
@@ -1261,18 +1248,40 @@ async def extract_pdf_mistral_v2(
         # Lägg till pass1_counts i pipeline_info för extraction_log.txt
         output["_pipeline_info"]["pass1_counts"] = validation_result["pass1_counts"]
 
-        # Logga resultat
+        # Logga resultat (använd charts_to_save för rätt antal)
         log_extraction_complete(
             pdf_path,
             len(output['tables']),
             len(output['sections']),
-            len(output['charts']),
+            len(charts_to_save),
             cost,
             total_elapsed,
         )
 
         # === STEG 7: SPARA TILL SUPABASE ===
         period_id, section_ids = await save_period_atomic_async(company_id, output, pdf_hash, str(pdf_path))
+
+        # === STEG 7b: SPARA GRAFER (nu har vi period_id) ===
+        from supabase_client import get_client as get_supabase_client
+
+        charts_with_paths = []
+        for chart in charts_to_save:
+            image_path = spara_graf(
+                chart=chart,
+                company_slug=company_slug,
+                period=period,
+                period_id=period_id,
+                base_folder=base_folder or "alla_rapporter",
+                supabase_client=get_supabase_client() if STORAGE_MODE == "cloud" else None,
+            )
+            chart_copy = chart.copy()
+            chart_copy["image_path"] = image_path
+            # Ta bort base64 för att spara minne
+            chart_copy.pop("image_base64", None)
+            charts_with_paths.append(chart_copy)
+
+        # Uppdatera output med sparade grafer
+        output["charts"] = charts_with_paths
 
         # Generera embeddings
         embeddings_count = 0

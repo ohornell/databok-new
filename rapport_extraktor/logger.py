@@ -72,11 +72,49 @@ class PlainFormatter(logging.Formatter):
         return f"{timestamp} | {level:<8} | {module:<20} | {record.getMessage()}"
 
 
+class SupabaseHandler(logging.Handler):
+    """Logging handler som skriver till Supabase."""
+
+    def __init__(self, company_id: str | None = None):
+        super().__init__()
+        self.company_id = company_id
+        self.period_id: str | None = None
+
+    def set_period_id(self, period_id: str):
+        """Sätt period_id för att koppla loggar till en specifik extraktion."""
+        self.period_id = period_id
+
+    def emit(self, record: logging.LogRecord):
+        try:
+            from supabase_client import log_to_supabase
+            log_to_supabase(
+                log_level=record.levelname,
+                module=record.name.split('.')[-1],
+                message=record.getMessage(),
+                period_id=self.period_id,
+                company_id=self.company_id,
+            )
+        except Exception:
+            pass  # Ignorera för att undvika rekursiv loggning
+
+
+# Global Supabase handler (för att kunna sätta period_id senare)
+_supabase_handler: Optional[SupabaseHandler] = None
+
+
+def set_period_id(period_id: str):
+    """Sätt period_id på Supabase-handler för att koppla loggar till extraktion."""
+    global _supabase_handler
+    if _supabase_handler:
+        _supabase_handler.set_period_id(period_id)
+
+
 def setup_logger(
     company_name: str,
     base_folder: str | Path | None = None,
     console_level: int = logging.DEBUG,
     file_level: int = logging.DEBUG,
+    company_id: str | None = None,
 ) -> logging.Logger:
     """
     Konfigurera och returnera huvudlogger.
@@ -86,11 +124,12 @@ def setup_logger(
         base_folder: Basmapp där bolagsmappar finns (default: alla_rapporter/)
         console_level: Loggnivå för konsol (default: DEBUG)
         file_level: Loggnivå för fil (default: DEBUG)
+        company_id: Company UUID för Supabase-loggning (valfritt)
 
     Returns:
         Konfigurerad logger-instans
     """
-    global _logger, _log_file_path
+    global _logger, _log_file_path, _supabase_handler
 
     # Skapa eller återanvänd logger
     logger = logging.getLogger('rapport_extraktor')
@@ -134,6 +173,13 @@ def setup_logger(
         logger.addHandler(file_handler)
 
         logger.info(f"[LOGG] Loggfil skapad: {_log_file_path}")
+
+    # === SUPABASE HANDLER (om cloud-läge och company_id finns) ===
+    if os.getenv("STORAGE_MODE") == "cloud" and company_id:
+        _supabase_handler = SupabaseHandler(company_id=company_id)
+        _supabase_handler.setLevel(logging.INFO)  # Endast INFO+ till Supabase
+        logger.addHandler(_supabase_handler)
+        logger.info("[LOGG] Supabase-loggning aktiverad")
 
     _logger = logger
     return logger

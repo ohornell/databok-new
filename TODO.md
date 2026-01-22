@@ -186,7 +186,7 @@ CREATE INDEX idx_extraction_logs_period ON extraction_logs(period_id);
 CREATE INDEX idx_extraction_logs_timestamp ON extraction_logs(timestamp);
 ```
 
----
+§---
 
 ## Redan klart
 
