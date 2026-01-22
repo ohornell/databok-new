@@ -7,6 +7,9 @@ python-multipart>=0.0.6
 # Anthropic
 anthropic>=0.39.0
 
+# Mistral AI
+mistralai>=1.0.0
+
 # Supabase
 supabase>=2.0.0
 

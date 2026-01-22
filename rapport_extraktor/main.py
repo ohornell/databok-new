@@ -31,11 +31,98 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from pipeline import extract_all_pdfs_multi_pass
+from pipeline_mistral import extract_pdf_multi_pass_mistral, get_mistral_client
+from pipeline_mistral_v2 import extract_pdf_mistral_v2, get_mistral_client as get_mistral_client_v2
 from excel_builder import build_databook
 from supabase_client import list_companies, get_or_create_company, slugify, check_database_setup, load_all_periods
 
 # Ladda miljövariabler
 load_dotenv()
+
+
+async def extract_all_pdfs_mistral(
+    pdf_paths: list[str],
+    company_name: str,
+    progress_callback=None,
+    use_cache: bool = True,
+    base_folder: str | None = None,
+    quiet: bool = False,
+) -> tuple[list[dict], list[tuple[str, str]]]:
+    """
+    Wrapper för Mistral-pipelinen med samma interface som Claude-pipelinen.
+    """
+    from supabase_client import get_or_create_company
+
+    company = get_or_create_company(company_name)
+    client = get_mistral_client()
+    semaphore = asyncio.Semaphore(2)  # Max 2 parallella anrop
+
+    successful = []
+    failed = []
+
+    for pdf_path in pdf_paths:
+        try:
+            result = await extract_pdf_multi_pass_mistral(
+                pdf_path=pdf_path,
+                client=client,
+                semaphore=semaphore,
+                company_id=company["id"],
+                company_name=company_name,
+                progress_callback=progress_callback,
+                use_cache=use_cache,
+                base_folder=base_folder,
+                quiet=quiet,
+            )
+            successful.append(result)
+        except Exception as e:
+            failed.append((pdf_path, str(e)))
+            if progress_callback:
+                progress_callback(pdf_path, f"failed: {e}", None)
+
+    return successful, failed
+
+
+async def extract_all_pdfs_mistral_v2(
+    pdf_paths: list[str],
+    company_name: str,
+    progress_callback=None,
+    use_cache: bool = True,
+    base_folder: str | None = None,
+    quiet: bool = False,
+) -> tuple[list[dict], list[tuple[str, str]]]:
+    """
+    Wrapper för Mistral v2-pipelinen (sidvis bearbetning med annotations).
+    Snabbare än v1 - kringgår 8-sidorsbegränsningen.
+    """
+    from supabase_client import get_or_create_company
+
+    company = get_or_create_company(company_name)
+    client = get_mistral_client_v2()
+    semaphore = asyncio.Semaphore(2)  # Max 2 parallella PDFs
+
+    successful = []
+    failed = []
+
+    for pdf_path in pdf_paths:
+        try:
+            result = await extract_pdf_mistral_v2(
+                pdf_path=pdf_path,
+                client=client,
+                semaphore=semaphore,
+                company_id=company["id"],
+                company_name=company_name,
+                progress_callback=progress_callback,
+                use_cache=use_cache,
+                base_folder=base_folder,
+                quiet=quiet,
+            )
+            successful.append(result)
+        except Exception as e:
+            failed.append((pdf_path, str(e)))
+            if progress_callback:
+                progress_callback(pdf_path, f"failed: {e}", None)
+
+    return successful, failed
 
 
 # Token-priser (USD per 1M tokens)
@@ -188,6 +275,10 @@ def create_progress_tracker(pdf_paths: list[str]):
                     pass_label = "Pass 1/3 (struktur) "
                 elif info["pass_info"] == "pass_2_3":
                     pass_label = "Pass 2/3 (data) "
+                elif info["pass_info"] == "ocr":
+                    pass_label = "OCR (1/2) "
+                elif info["pass_info"] == "llm":
+                    pass_label = "LLM (2/2) "
                 elif info["pass_info"] == "validating":
                     pass_label = "Validerar "
                 details = f"{pass_label}{format_time(elapsed)}"
@@ -283,12 +374,16 @@ def guess_company_name(pdf_path: str) -> str:
     return name.title() if name else "Okänt"
 
 
-def run_interactive_mode(pdf_path: str | None = None):
+def run_interactive_mode(pdf_path: str | None = None, model: str = "claude"):
     """
     Kör interaktivt läge med nytt flöde:
     1. START - Välj bolag från databasen
     2. Välj läge: Skapa databok (alla perioder) eller Extrahera kvartal
     3. Om kvartal - välj från lista eller extrahera ny PDF
+
+    Args:
+        pdf_path: Valfri PDF-fil att extrahera
+        model: "claude" eller "mistral" för val av extraktionspipeline
     """
     import re
     from supabase_client import get_or_create_company, period_exists, get_pdf_hash, load_all_periods
@@ -382,6 +477,20 @@ def run_interactive_mode(pdf_path: str | None = None):
         print("   3) Extrahera nytt kvartal fran PDF")
         print("   4) Batch-extraktion (mapp med flera PDFs)")
         mode_choice = input("\n> ").strip()
+
+    # === VÄLJ PIPELINE (endast för extraktion) ===
+    if mode_choice in ("3", "4"):
+        print("\nVälj extraktionsmodell:")
+        print("   1) Claude (Haiku + Sonnet + Haiku) - Standard")
+        print("   2) Mistral (OCR + Mistral Large)")
+        print("   3) Mistral v2 (Sidvis annotations) - Snabbast!")
+        pipeline_choice = input("\n> ").strip()
+        if pipeline_choice == "2":
+            model = "mistral"
+        elif pipeline_choice == "3":
+            model = "mistral_v2"
+        else:
+            model = "claude"
 
     # === LÄGE 1: FULLSTÄNDIG DATABOK ===
     if mode_choice == "1":
@@ -493,8 +602,13 @@ def run_interactive_mode(pdf_path: str | None = None):
             print(f"❌ Fil hittades inte: {path}")
             return
 
-        # Multi-pass är nu standard
-        print("\nAnvänder multi-pass pipeline (Haiku + Sonnet + Haiku)")
+        # Visa vilken pipeline som används
+        if model == "mistral":
+            print("\nAnvänder Mistral pipeline (OCR + Mistral Large)")
+        elif model == "mistral_v2":
+            print("\nAnvänder Mistral v2 pipeline (Sidvis annotations)")
+        else:
+            print("\nAnvänder Claude pipeline (Haiku + Sonnet + Haiku)")
 
         # === KONTROLLERA CACHE ===
         pdf_hash = get_pdf_hash(str(path))
@@ -545,16 +659,39 @@ def run_interactive_mode(pdf_path: str | None = None):
             else:
                 base_folder = str(path.parent.parent)
 
-            successful, failed = asyncio.run(
-                extract_all_pdfs_multi_pass(
-                    [str(path)],
-                    company_name,
-                    on_progress,
-                    use_cache=False,
-                    base_folder=base_folder,
-                    quiet=True,  # Undertryck output - progress-tracker hanterar UI
+            if model == "mistral":
+                successful, failed = asyncio.run(
+                    extract_all_pdfs_mistral(
+                        [str(path)],
+                        company_name,
+                        on_progress,
+                        use_cache=False,
+                        base_folder=base_folder,
+                        quiet=True,
+                    )
                 )
-            )
+            elif model == "mistral_v2":
+                successful, failed = asyncio.run(
+                    extract_all_pdfs_mistral_v2(
+                        [str(path)],
+                        company_name,
+                        on_progress,
+                        use_cache=False,
+                        base_folder=base_folder,
+                        quiet=True,
+                    )
+                )
+            else:
+                successful, failed = asyncio.run(
+                    extract_all_pdfs_multi_pass(
+                        [str(path)],
+                        company_name,
+                        on_progress,
+                        use_cache=False,
+                        base_folder=base_folder,
+                        quiet=True,
+                    )
+                )
             stop_timer()
             print()
 
@@ -702,7 +839,12 @@ def run_interactive_mode(pdf_path: str | None = None):
             return
 
         # Extraktion
-        print("\n[~] Startar batch-extraktion...\n")
+        if model == "mistral":
+            print("\n[~] Startar batch-extraktion (Mistral)...\n")
+        elif model == "mistral_v2":
+            print("\n[~] Startar batch-extraktion (Mistral v2)...\n")
+        else:
+            print("\n[~] Startar batch-extraktion (Claude)...\n")
 
         on_progress, state, stop_timer = create_progress_tracker(pdf_path_strs)
 
@@ -714,16 +856,39 @@ def run_interactive_mode(pdf_path: str | None = None):
         else:
             base_folder = str(folder_path.parent)
 
-        successful, failed = asyncio.run(
-            extract_all_pdfs_multi_pass(
-                pdf_path_strs,
-                company_name,
-                on_progress,
-                use_cache=True,
-                base_folder=base_folder,
-                quiet=True,  # Undertryck output - progress-tracker hanterar UI
+        if model == "mistral":
+            successful, failed = asyncio.run(
+                extract_all_pdfs_mistral(
+                    pdf_path_strs,
+                    company_name,
+                    on_progress,
+                    use_cache=True,
+                    base_folder=base_folder,
+                    quiet=True,
+                )
             )
-        )
+        elif model == "mistral_v2":
+            successful, failed = asyncio.run(
+                extract_all_pdfs_mistral_v2(
+                    pdf_path_strs,
+                    company_name,
+                    on_progress,
+                    use_cache=True,
+                    base_folder=base_folder,
+                    quiet=True,
+                )
+            )
+        else:
+            successful, failed = asyncio.run(
+                extract_all_pdfs_multi_pass(
+                    pdf_path_strs,
+                    company_name,
+                    on_progress,
+                    use_cache=True,
+                    base_folder=base_folder,
+                    quiet=True,
+                )
+            )
         stop_timer()
         print()
 
@@ -887,6 +1052,12 @@ Exempel:
         action="store_true",
         help="Interaktivt läge - guidat flöde för att skapa databöcker"
     )
+    parser.add_argument(
+        "--model", "-m",
+        choices=["claude", "mistral", "mistral_v2"],
+        default="claude",
+        help="Välj AI-modell för extraktion: claude (default), mistral, eller mistral_v2 (snabbast)"
+    )
 
     args = parser.parse_args()
 
@@ -909,7 +1080,7 @@ Exempel:
         elif args.add:
             pdf_file = args.add[0]
 
-        run_interactive_mode(pdf_file)
+        run_interactive_mode(pdf_file, model=args.model)
         return
 
     # === LISTA BOLAG ===
@@ -1006,16 +1177,39 @@ Exempel:
         else:
             base_folder = str(first_path.parent.parent)
 
-        new_results, failed = asyncio.run(
-            extract_all_pdfs_multi_pass(
-                add_paths,
-                args.company,
-                on_progress,
-                use_cache=not args.no_cache,
-                base_folder=base_folder,
-                quiet=True,  # Undertryck output - progress-tracker hanterar UI
+        if args.model == "mistral":
+            new_results, failed = asyncio.run(
+                extract_all_pdfs_mistral(
+                    add_paths,
+                    args.company,
+                    on_progress,
+                    use_cache=not args.no_cache,
+                    base_folder=base_folder,
+                    quiet=True,
+                )
             )
-        )
+        elif args.model == "mistral_v2":
+            new_results, failed = asyncio.run(
+                extract_all_pdfs_mistral_v2(
+                    add_paths,
+                    args.company,
+                    on_progress,
+                    use_cache=not args.no_cache,
+                    base_folder=base_folder,
+                    quiet=True,
+                )
+            )
+        else:
+            new_results, failed = asyncio.run(
+                extract_all_pdfs_multi_pass(
+                    add_paths,
+                    args.company,
+                    on_progress,
+                    use_cache=not args.no_cache,
+                    base_folder=base_folder,
+                    quiet=True,
+                )
+            )
         stop_timer()
         print()  # Ny rad efter progress
 
@@ -1089,18 +1283,43 @@ Exempel:
     else:
         base_folder = str(pdf_dir.parent)
 
-    # Kör extraktion (multi-pass är standard)
-    print("🔄 Multi-pass pipeline (Haiku → Sonnet → Haiku)")
-    successful, failed = asyncio.run(
-        extract_all_pdfs_multi_pass(
-            pdf_path_strs,
-            args.company,
-            on_progress,
-            use_cache=not args.no_cache,
-            base_folder=base_folder,
-            quiet=True,  # Undertryck output - progress-tracker hanterar UI
+    # Kör extraktion
+    if args.model == "mistral":
+        print("🔄 Mistral pipeline (OCR → Mistral Large)")
+        successful, failed = asyncio.run(
+            extract_all_pdfs_mistral(
+                pdf_path_strs,
+                args.company,
+                on_progress,
+                use_cache=not args.no_cache,
+                base_folder=base_folder,
+                quiet=True,
+            )
         )
-    )
+    elif args.model == "mistral_v2":
+        print("🔄 Mistral v2 pipeline (Sidvis annotations)")
+        successful, failed = asyncio.run(
+            extract_all_pdfs_mistral_v2(
+                pdf_path_strs,
+                args.company,
+                on_progress,
+                use_cache=not args.no_cache,
+                base_folder=base_folder,
+                quiet=True,
+            )
+        )
+    else:
+        print("🔄 Claude pipeline (Haiku → Sonnet → Haiku)")
+        successful, failed = asyncio.run(
+            extract_all_pdfs_multi_pass(
+                pdf_path_strs,
+                args.company,
+                on_progress,
+                use_cache=not args.no_cache,
+                base_folder=base_folder,
+                quiet=True,
+            )
+        )
     stop_timer()
     print("\n")  # Ny rad efter progress bar
 

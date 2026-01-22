@@ -837,6 +837,7 @@ def save_charts(period_id: str, charts: list[dict]) -> None:
             "y_axis": chart.get("y_axis"),
             "estimated": chart.get("estimated", True),
             "data_points": chart.get("data_points", []),
+            "image_path": chart.get("image_path"),  # Sökväg till grafbild
         })
 
     if rows:

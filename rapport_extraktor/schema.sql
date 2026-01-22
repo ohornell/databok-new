@@ -109,8 +109,12 @@ CREATE TABLE charts (
     y_axis TEXT,
     estimated BOOLEAN DEFAULT true,  -- true = värden uppskattade visuellt, false = exakta värden
     data_points JSONB,  -- [{"label": "Q1 2024", "value": 850}, ...]
+    image_path TEXT,  -- Sökväg till grafbild (lokal eller URL)
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Om tabellen redan finns, lägg till image_path:
+-- ALTER TABLE charts ADD COLUMN IF NOT EXISTS image_path TEXT;
 
 CREATE INDEX idx_charts_period ON charts(period_id);
 CREATE INDEX idx_charts_type ON charts(chart_type);

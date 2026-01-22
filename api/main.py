@@ -46,6 +46,7 @@ env_path = Path(__file__).parent.parent / "rapport_extraktor" / ".env"
 load_dotenv(env_path)
 
 from pipeline import extract_pdf_multi_pass
+from pipeline_mistral import extract_pdf_multi_pass_mistral, get_mistral_client
 from excel_builder import build_databook
 from supabase_client import (
     get_or_create_company,
@@ -316,7 +317,7 @@ class PeriodResponse(BaseModel):
 # BACKGROUND TASK
 # ============================================
 
-async def run_extraction(job_id: str, pdf_path: str, company_name: str, filename: str):
+async def run_extraction(job_id: str, pdf_path: str, company_name: str, filename: str, model: str = "claude"):
     """Kör extraktion i bakgrunden."""
     try:
         jobs[job_id]["status"] = "processing"
@@ -326,12 +327,6 @@ async def run_extraction(job_id: str, pdf_path: str, company_name: str, filename
         company = get_or_create_company(company_name)
         company_id = company["id"]
 
-        # Skapa Anthropic-klient
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise ValueError("ANTHROPIC_API_KEY saknas")
-
-        client = AsyncAnthropic(api_key=api_key, timeout=300)
         semaphore = asyncio.Semaphore(10)
 
         # Progress callback
@@ -348,15 +343,38 @@ async def run_extraction(job_id: str, pdf_path: str, company_name: str, filename
             if info and "cost_sek" in info:
                 jobs[job_id]["cost_sek"] = info["cost_sek"]
 
-        # Kör extraktion
-        result = await extract_pdf_multi_pass(
-            pdf_path=pdf_path,
-            client=client,
-            semaphore=semaphore,
-            company_id=company_id,
-            progress_callback=on_progress,
-            use_cache=True
-        )
+        # Kör extraktion med vald modell
+        if model == "mistral":
+            # Mistral AI pipeline
+            mistral_api_key = os.environ.get("MISTRAL_API_KEY")
+            if not mistral_api_key:
+                raise ValueError("MISTRAL_API_KEY saknas")
+
+            client = get_mistral_client()
+            result = await extract_pdf_multi_pass_mistral(
+                pdf_path=pdf_path,
+                client=client,
+                semaphore=semaphore,
+                company_id=company_id,
+                progress_callback=on_progress,
+                use_cache=True,
+                quiet=True
+            )
+        else:
+            # Claude/Anthropic pipeline (default)
+            api_key = os.environ.get("ANTHROPIC_API_KEY")
+            if not api_key:
+                raise ValueError("ANTHROPIC_API_KEY saknas")
+
+            client = AsyncAnthropic(api_key=api_key, timeout=300)
+            result = await extract_pdf_multi_pass(
+                pdf_path=pdf_path,
+                client=client,
+                semaphore=semaphore,
+                company_id=company_id,
+                progress_callback=on_progress,
+                use_cache=True
+            )
 
         # Skapa Excel
         excel_path = pdf_path.replace(".pdf", ".xlsx")
@@ -404,18 +422,23 @@ async def root():
 async def extract_pdf(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    company: str = Form(...)
+    company: str = Form(...),
+    model: str = Form("claude")
 ):
     """
     Ladda upp PDF och starta extraktion.
 
     - **file**: PDF-fil att extrahera
     - **company**: Bolagsnamn
+    - **model**: Extraktionsmodell - "claude" (default) eller "mistral"
 
     Returnerar job_id som kan användas för att kolla status.
     """
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Endast PDF-filer stöds")
+
+    if model not in ("claude", "mistral"):
+        raise HTTPException(400, "model måste vara 'claude' eller 'mistral'")
 
     # Skapa jobb-ID
     job_id = str(uuid.uuid4())[:8]
@@ -432,6 +455,7 @@ async def extract_pdf(
         "company": company,
         "filename": file.filename,
         "pdf_path": pdf_path,
+        "model": model,
         "created_at": datetime.now().isoformat(),
         "cost_sek": None,
         "error": None,
@@ -444,11 +468,11 @@ async def extract_pdf(
     }
 
     # Starta extraktion i bakgrunden
-    background_tasks.add_task(run_extraction, job_id, pdf_path, company, file.filename)
+    background_tasks.add_task(run_extraction, job_id, pdf_path, company, file.filename, model)
 
     return ExtractResponse(
         job_id=job_id,
-        message=f"Extraktion startad för {file.filename}"
+        message=f"Extraktion startad för {file.filename} med {model}"
     )
 
 
@@ -625,19 +649,24 @@ async def list_jobs():
 async def extract_batch(
     background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(...),
-    company: str = Form(...)
+    company: str = Form(...),
+    model: str = Form("claude")
 ):
     """
     Ladda upp flera PDF-filer och starta batch-extraktion.
 
     - **files**: Lista med PDF-filer att extrahera
     - **company**: Bolagsnamn (samma för alla filer)
+    - **model**: Extraktionsmodell - "claude" (default) eller "mistral"
 
     Returnerar batch_id och job_ids för varje fil.
     Använd `/extract/batch/{batch_id}` för att kolla status på alla filer.
     """
     if not files:
         raise HTTPException(400, "Inga filer uppladdade")
+
+    if model not in ("claude", "mistral"):
+        raise HTTPException(400, "model måste vara 'claude' eller 'mistral'")
 
     # Validera alla filer först
     for file in files:
@@ -651,6 +680,7 @@ async def extract_batch(
     batches[batch_id] = {
         "batch_id": batch_id,
         "company": company,
+        "model": model,
         "job_ids": [],
         "created_at": datetime.now().isoformat(),
     }
@@ -676,6 +706,7 @@ async def extract_batch(
             "company": company,
             "filename": file.filename,
             "pdf_path": pdf_path,
+            "model": model,
             "created_at": datetime.now().isoformat(),
             "cost_sek": None,
             "error": None,
@@ -688,11 +719,11 @@ async def extract_batch(
         }
 
         # Starta extraktion i bakgrunden
-        background_tasks.add_task(run_extraction, job_id, pdf_path, company, file.filename)
+        background_tasks.add_task(run_extraction, job_id, pdf_path, company, file.filename, model)
 
     return BatchResponse(
         batch_id=batch_id,
-        message=f"Batch-extraktion startad för {len(files)} filer",
+        message=f"Batch-extraktion startad för {len(files)} filer med {model}",
         job_ids=job_ids
     )
 

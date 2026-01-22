@@ -1070,21 +1070,48 @@ def db_update_knowledge(
         return {"error": f"Kunde inte uppdatera: {str(e)}"}
 
 
-def db_get_charts(company_slug: str, period: str | None = None) -> dict:
-    """Hämta grafer/diagram för en period."""
+def _load_image_as_base64(image_path: str) -> str | None:
+    """Läs en bildfil och returnera som base64-sträng."""
+    import base64
+    from pathlib import Path
+
+    if not image_path:
+        return None
+
+    path = Path(image_path)
+    if not path.exists():
+        return None
+
+    try:
+        with open(path, "rb") as f:
+            image_data = f.read()
+        return f"data:image/png;base64,{base64.b64encode(image_data).decode()}"
+    except Exception:
+        return None
+
+
+def db_get_charts(company_slug: str, period: str | None = None, include_images: bool = True) -> dict:
+    """
+    Hämta grafer/diagram för en period.
+
+    Args:
+        company_slug: Bolagets slug eller namn
+        period: T.ex. "Q3 2024" (om None, hämta senaste)
+        include_images: Om True, inkludera base64-kodade bilder för visuell analys
+    """
     client = get_client()
-    
+
     # Hitta bolag
     company = client.table("companies").select("id, name").eq("slug", company_slug).execute()
     if not company.data:
         company = client.table("companies").select("id, name").ilike("name", f"%{company_slug}%").execute()
-    
+
     if not company.data:
         return {"error": f"Bolag '{company_slug}' hittades inte"}
-    
+
     company_id = company.data[0]["id"]
     company_name = company.data[0]["name"]
-    
+
     # Hitta period (inkluderar source_file och pdf_hash direkt)
     if period:
         import re
@@ -1114,15 +1141,24 @@ def db_get_charts(company_slug: str, period: str | None = None) -> dict:
 
         formatted_charts = []
         for c in charts.data:
-            formatted_charts.append({
+            chart_data = {
                 "title": c["title"],
                 "type": c["chart_type"],
                 "page": c["page_number"],
                 "x_axis": c.get("x_axis"),
                 "y_axis": c.get("y_axis"),
                 "estimated": c["estimated"],
-                "data_points": c["data_points"]
-            })
+                "data_points": c["data_points"],
+                "image_path": c.get("image_path"),
+            }
+
+            # Läs in bilden som base64 om den finns och include_images är True
+            if include_images and c.get("image_path"):
+                image_base64 = _load_image_as_base64(c["image_path"])
+                if image_base64:
+                    chart_data["image_base64"] = image_base64
+
+            formatted_charts.append(chart_data)
 
         return {
             "company": company_name,
@@ -1131,7 +1167,8 @@ def db_get_charts(company_slug: str, period: str | None = None) -> dict:
                 "file": p.get("source_file"),
                 "pdf_hash": p.get("pdf_hash")
             },
-            "charts": formatted_charts
+            "charts": formatted_charts,
+            "note": "Grafer med image_base64 kan analyseras visuellt av Claude" if include_images else None
         }
     except Exception:
         return {
@@ -1296,7 +1333,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_charts",
-            description="Hämta extraherade grafer och diagram med datapunkter för ett bolag",
+            description="Hämta extraherade grafer och diagram för ett bolag. Med include_images=true kan Claude se och analysera grafbilderna visuellt.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1307,6 +1344,10 @@ async def list_tools() -> list[Tool]:
                     "period": {
                         "type": "string",
                         "description": "Period, t.ex. 'Q3 2024'. Om utelämnad hämtas senaste."
+                    },
+                    "include_images": {
+                        "type": "boolean",
+                        "description": "Inkludera base64-kodade bilder för visuell analys. Default: true"
                     }
                 },
                 "required": ["company"]
@@ -1692,7 +1733,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         elif name == "get_charts":
             result = db_get_charts(
                 arguments["company"],
-                arguments.get("period")
+                arguments.get("period"),
+                include_images=arguments.get("include_images", True)
             )
 
         elif name == "compare_companies":
