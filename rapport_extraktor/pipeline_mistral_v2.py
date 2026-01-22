@@ -40,6 +40,15 @@ from supabase_client import (
     load_period,
     slugify,
 )
+from extraction_log import process_extraction_complete
+from logger import (
+    get_logger,
+    log_extraction_start,
+    log_extraction_complete,
+    log_ocr_progress,
+    log_api_request,
+    log_validation_result,
+)
 
 # Mistral Modell-IDs
 MISTRAL_OCR = "mistral-ocr-latest"
@@ -583,13 +592,14 @@ async def bearbeta_alla_sidor(
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # Filtrera bort exceptions och logga fel
+    logger = get_logger('pipeline_mistral_v2')
     valid_results = []
     for i, result in enumerate(results):
         if isinstance(result, Exception):
-            if not quiet:
-                print(f"   [FEL] Sida {i+1}: {result}")
+            logger.warning(f"[OCR] Sida {i+1} misslyckades: {result}")
         else:
             valid_results.append(result)
+            log_ocr_progress(i + 1, len(sidor))
 
     # Sortera efter sidnummer
     valid_results.sort(key=lambda x: x.get("page_num", 0))
@@ -781,6 +791,83 @@ def sammanfoga_resultat(alla_resultat: list[dict]) -> dict:
 
 
 # ============================================
+# VALIDERING AV EXTRAKTIONSRESULTAT
+# ============================================
+
+def validate_extraction_result(result: dict, num_pages: int) -> dict:
+    """
+    Validera att extraktionen är rimlig jämfört med PDF:en.
+
+    Kontroller:
+    1. Minst 1 tabell per 4 sidor (heuristik för kvartalsrapporter)
+    2. Tabeller har minst 2 rader
+    3. Sektioner har minst 50 tecken innehåll
+    4. Grafer har title
+
+    Args:
+        result: Sammanfogat extraktionsresultat
+        num_pages: Antal sidor i PDF:en
+
+    Returns:
+        dict med {is_valid, warnings, errors, pass1_counts}
+    """
+    warnings = []
+    errors = []
+
+    tables = result.get("tables", [])
+    sections = result.get("sections", [])
+    charts = result.get("charts", [])
+
+    # === KONTROLL 1: Antal tabeller ===
+    expected_min_tables = max(1, num_pages // 4)  # Minst 1 tabell per 4 sidor
+    if len(tables) < expected_min_tables:
+        warnings.append(
+            f"Få tabeller extraherade: {len(tables)} (förväntade minst {expected_min_tables} för {num_pages} sidor)"
+        )
+
+    # === KONTROLL 2: Tabellkvalitet ===
+    empty_tables = 0
+    for table in tables:
+        rows = table.get("rows", [])
+        if len(rows) < 2:
+            empty_tables += 1
+            warnings.append(f"Tabell '{table.get('title', '?')}' har bara {len(rows)} rad(er)")
+
+    # === KONTROLL 3: Sektionskvalitet ===
+    short_sections = 0
+    for section in sections:
+        content = section.get("content", "")
+        if len(content) < 50:
+            short_sections += 1
+
+    if short_sections > 0:
+        warnings.append(f"{short_sections} sektion(er) har mindre än 50 tecken")
+
+    # === KONTROLL 4: Grafer ===
+    charts_without_title = sum(1 for c in charts if not c.get("title"))
+    if charts_without_title > 0:
+        warnings.append(f"{charts_without_title} graf(er) saknar titel")
+
+    # === BEDÖMNING ===
+    # Kritiska fel som gör extraktionen ogiltig
+    if len(tables) == 0 and num_pages > 2:
+        errors.append("Inga tabeller extraherade från ett flersidigt dokument")
+
+    is_valid = len(errors) == 0
+
+    return {
+        "is_valid": is_valid,
+        "warnings": warnings,
+        "errors": errors,
+        "pass1_counts": {
+            "tables": len(tables),
+            "sections": len(sections),
+            "charts": len(charts),
+        }
+    }
+
+
+# ============================================
 # PIXTRAL GRAF-DATAEXTRAKTION
 # ============================================
 
@@ -878,8 +965,8 @@ Extrahera alla datapunkter du kan se i grafen."""
             chart["estimated"] = result.get("estimated", True)
 
         except Exception as e:
-            if not quiet:
-                print(f"   [VARNING] Pixtral kunde inte analysera graf '{title}': {e}")
+            logger = get_logger('pixtral')
+            logger.warning(f"[PIXTRAL] Kunde inte analysera graf '{title}': {e}")
             # Behåll tom data_points vid fel
             chart["data_points"] = []
 
@@ -905,8 +992,8 @@ async def analyze_charts_with_pixtral(
     if not charts:
         return charts
 
-    if not quiet:
-        print(f"   [PIXTRAL] Analyserar {len(charts)} grafer för datapunkter...", flush=True)
+    logger = get_logger('pixtral')
+    logger.info(f"[PIXTRAL] Analyserar {len(charts)} grafer för datapunkter...")
 
     semaphore = asyncio.Semaphore(MAX_PARALLEL_PIXTRAL)
 
@@ -918,8 +1005,7 @@ async def analyze_charts_with_pixtral(
 
     # Räkna lyckade extraktioner
     successful = sum(1 for c in analyzed_charts if c.get("data_points"))
-    if not quiet:
-        print(f"   [PIXTRAL] {successful}/{len(charts)} grafer fick datapunkter", flush=True)
+    logger.info(f"[PIXTRAL] {successful}/{len(charts)} grafer fick datapunkter")
 
     return list(analyzed_charts)
 
@@ -1059,6 +1145,10 @@ async def extract_pdf_mistral_v2(
     if progress_callback:
         progress_callback(pdf_path, "extracting", None)
 
+    # Hämta logger
+    logger = get_logger('pipeline_mistral_v2')
+    log_extraction_start(pdf_path, company_name, "mistral-v2-annotations")
+
     # Skapa temporär mapp för ensidiga PDFs
     temp_dir = tempfile.mkdtemp(prefix="mistral_v2_")
 
@@ -1066,22 +1156,19 @@ async def extract_pdf_mistral_v2(
         extraction_start = time.perf_counter()
 
         # === STEG 1: DELA UPP PDF ===
-        if not quiet:
-            print(f"\n   [SPLIT] Delar upp {filename}...", flush=True)
+        logger.debug(f"[SPLIT] Delar upp {filename}...")
 
         sidor = dela_upp_pdf(pdf_path, temp_dir)
         num_pages = len(sidor)
 
-        if not quiet:
-            print(f"   Uppdelad i {num_pages} sidor", flush=True)
+        logger.info(f"[SPLIT] Uppdelad i {num_pages} sidor")
 
         # === STEG 2: SKAPA SCHEMAN ===
         document_schema = response_format_from_pydantic_model(DocumentAnnotation)
         bbox_schema = response_format_from_pydantic_model(BBoxAnnotation)
 
         # === STEG 3: BEARBETA ALLA SIDOR ===
-        if not quiet:
-            print(f"   [OCR] Bearbetar {num_pages} sidor med annotations...", flush=True)
+        logger.info(f"[OCR] Bearbetar {num_pages} sidor med annotations...")
 
         if progress_callback:
             progress_callback(pdf_path, "ocr", None)
@@ -1098,8 +1185,8 @@ async def extract_pdf_mistral_v2(
 
         ocr_elapsed = time.perf_counter() - extraction_start
 
-        if not quiet:
-            print(f"   OCR klar: {ocr_elapsed:.1f}s | {len(alla_resultat)} sidor bearbetade", flush=True)
+        logger.info(f"[OCR] Klar: {ocr_elapsed:.1f}s | {len(alla_resultat)} sidor bearbetade")
+        log_api_request(MISTRAL_OCR, "ocr-batch", 0, 0)
 
         # === STEG 4: SAMMANFOGA RESULTAT ===
         sammanfogat = sammanfoga_resultat(alla_resultat)
@@ -1116,8 +1203,7 @@ async def extract_pdf_mistral_v2(
                 quiet=quiet,
             )
             pixtral_elapsed = time.perf_counter() - pixtral_start
-            if not quiet:
-                print(f"   Pixtral klar: {pixtral_elapsed:.1f}s", flush=True)
+            logger.info(f"[PIXTRAL] Grafanalys klar: {pixtral_elapsed:.1f}s")
 
         # === STEG 5: SPARA GRAFER ===
         period = sammanfogat["metadata"].get("period", "")
@@ -1162,11 +1248,28 @@ async def extract_pdf_mistral_v2(
             }
         }
 
-        if not quiet:
-            print(f"\n   [RESULTAT]", flush=True)
-            print(f"      Tabeller: {len(output['tables'])} st", flush=True)
-            print(f"      Grafer: {len(output['charts'])} st", flush=True)
-            print(f"      Tid: {total_elapsed:.1f}s | Kostnad: {cost:.4f} SEK", flush=True)
+        # === VALIDERING ===
+        validation_result = validate_extraction_result(sammanfogat, num_pages)
+        log_validation_result(
+            validation_result["is_valid"],
+            len(output['tables']),
+            validation_result["pass1_counts"]["tables"],
+            validation_result["warnings"],
+            validation_result["errors"],
+        )
+
+        # Lägg till pass1_counts i pipeline_info för extraction_log.txt
+        output["_pipeline_info"]["pass1_counts"] = validation_result["pass1_counts"]
+
+        # Logga resultat
+        log_extraction_complete(
+            pdf_path,
+            len(output['tables']),
+            len(output['sections']),
+            len(output['charts']),
+            cost,
+            total_elapsed,
+        )
 
         # === STEG 7: SPARA TILL SUPABASE ===
         period_id, section_ids = await save_period_atomic_async(company_id, output, pdf_hash, str(pdf_path))
@@ -1177,19 +1280,30 @@ async def extract_pdf_mistral_v2(
             try:
                 from supabase_client import generate_embeddings_for_sections_async
                 embeddings_count = await generate_embeddings_for_sections_async(section_ids)
-                if embeddings_count > 0 and not quiet:
-                    print(f"   [EMBEDDING] {embeddings_count} sections har fått embeddings")
+                if embeddings_count > 0:
+                    logger.info(f"[EMBEDDING] {embeddings_count}/{len(section_ids)} sektioner fick embeddings")
             except Exception as emb_err:
-                if not quiet:
-                    print(f"   [EMBEDDING] Kunde inte generera embeddings: {emb_err}")
+                logger.warning(f"[EMBEDDING] Kunde inte generera embeddings: {emb_err}")
+
+        # Bestäm slutstatus baserat på validering
+        final_status = "success" if validation_result["is_valid"] else "partial"
+        all_errors = validation_result["errors"] + validation_result["warnings"]
 
         # Uppdatera slutstatus
         update_period_status(
             period_id,
-            status="success",
-            errors=None,
+            status=final_status,
+            errors=all_errors if all_errors else None,
             embeddings_count=embeddings_count
         )
+
+        # Flytta fil och uppdatera logg
+        if base_folder:
+            try:
+                process_extraction_complete(pdf_path, company_name, base_folder)
+                logger.info(f"[FIL] PDF flyttad till ligger_i_databasen/")
+            except Exception as move_err:
+                logger.warning(f"[FIL] Kunde inte flytta PDF: {move_err}")
 
         if progress_callback:
             progress_callback(pdf_path, "done", {
@@ -1201,6 +1315,7 @@ async def extract_pdf_mistral_v2(
         return output
 
     except Exception as e:
+        logger.error(f"[FEL] Extraktion misslyckades: {type(e).__name__}: {e}")
         if progress_callback:
             progress_callback(pdf_path, f"failed: {e}", None)
         raise

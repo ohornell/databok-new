@@ -257,7 +257,7 @@ def collect_all_errors(report_data: list[dict], company_name: str) -> list[dict]
         rapport = f"Q{r['quarter']} {r['year']} {company_name}"
 
         # 1. Saknade tabeller (hittades i pass 1 men extraherades inte)
-        missing_tables = extraction_meta.get("missing_tables", [])
+        missing_tables = extraction_meta.get("missing_tables") or []
         for mt in missing_tables:
             all_errors.append({
                 "rapport": rapport,
@@ -266,8 +266,8 @@ def collect_all_errors(report_data: list[dict], company_name: str) -> list[dict]
             })
 
         # 2. Tabeller med valideringsfel (extraherades men har problem)
-        table_val = validation.get("tables", {})
-        for err in table_val.get("errors", []):
+        table_val = validation.get("tables") or {}
+        for err in (table_val.get("errors") or []):
             all_errors.append({
                 "rapport": rapport,
                 "beskrivning": f"FEL: '{err.get('table_title', '?')}' - {err.get('message', '?')}",
@@ -275,8 +275,8 @@ def collect_all_errors(report_data: list[dict], company_name: str) -> list[dict]
             })
 
         # 3. Sektionsvarningar
-        section_val = validation.get("sections", {})
-        for warn in section_val.get("warnings", []):
+        section_val = validation.get("sections") or {}
+        for warn in (section_val.get("warnings") or []):
             all_errors.append({
                 "rapport": rapport,
                 "beskrivning": f"VARNING: Sektion '{warn.get('section_title', '?')}' - {warn.get('message', '?')}",
@@ -683,8 +683,26 @@ def process_extraction_complete(
     Returns:
         True om allt lyckades
     """
-    pdf_path = Path(pdf_path)
-    company_slug = slugify(company_name)
+    # Validera indata
+    if not pdf_path:
+        print("[!] process_extraction_complete: pdf_path saknas")
+        return False
+
+    if not company_name:
+        print("[!] process_extraction_complete: company_name saknas")
+        return False
+
+    try:
+        pdf_path = Path(pdf_path)
+    except Exception as e:
+        print(f"[!] process_extraction_complete: Ogiltig pdf_path: {e}")
+        return False
+
+    try:
+        company_slug = slugify(company_name)
+    except Exception as e:
+        print(f"[!] process_extraction_complete: Kunde inte skapa slug: {e}")
+        return False
 
     # Auto-detektera base_folder från pdf_path
     if base_folder is None:
@@ -696,13 +714,25 @@ def process_extraction_complete(
         else:
             base_folder = parent.parent
 
-    base_folder = Path(base_folder)
+    try:
+        base_folder = Path(base_folder)
+    except Exception as e:
+        print(f"[!] process_extraction_complete: Ogiltig base_folder: {e}")
+        return False
+
+    # Verifiera att base_folder är en mapp
+    if not base_folder.exists() or not base_folder.is_dir():
+        print(f"[!] process_extraction_complete: base_folder finns inte: {base_folder}")
+        return False
 
     # Flytta fil
     new_path = move_file_after_extraction(pdf_path, company_slug, base_folder)
 
-    # Uppdatera logg
-    update_extraction_log(company_slug, base_folder)
+    # Uppdatera logg (fortsätt även om flytten misslyckades)
+    try:
+        update_extraction_log(company_slug, base_folder)
+    except Exception as e:
+        print(f"[!] Kunde inte uppdatera extraktionslogg: {e}")
 
     return new_path is not None
 

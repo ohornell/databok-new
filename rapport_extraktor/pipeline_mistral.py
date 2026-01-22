@@ -33,6 +33,13 @@ from supabase_client import (
     period_exists,
     load_period,
 )
+from extraction_log import process_extraction_complete
+from logger import (
+    get_logger,
+    log_extraction_start,
+    log_extraction_complete,
+    log_api_request,
+)
 
 # Mistral Modell-IDs
 MISTRAL_OCR = "mistral-ocr-latest"
@@ -203,6 +210,10 @@ async def extract_pdf_multi_pass_mistral(
     if progress_callback:
         progress_callback(pdf_path, "extracting", None)
 
+    # Hämta logger
+    logger = get_logger('pipeline_mistral')
+    log_extraction_start(pdf_path, company_name, "mistral-2-step")
+
     uploaded_file_id = None  # För cleanup efter OCR
 
     last_error = None
@@ -215,8 +226,7 @@ async def extract_pdf_multi_pass_mistral(
             if progress_callback:
                 progress_callback(pdf_path, "ocr", None)
 
-            if not quiet:
-                print(f"\n   [UPLOAD] Laddar upp {filename} till Mistral Cloud...", flush=True)
+            logger.debug(f"[UPLOAD] Laddar upp {filename} till Mistral Cloud...")
 
             # Ladda upp PDF till Mistral Cloud
             # Läs hela filen först för att undvika problem med run_in_executor
@@ -242,8 +252,7 @@ async def extract_pdf_multi_pass_mistral(
                 partial(client.files.get_signed_url, file_id=uploaded_file.id)
             )
 
-            if not quiet:
-                print(f"   [OCR] Extraherar text med bbox annotations...", flush=True)
+            logger.debug("[OCR] Extraherar text med bbox annotations...")
 
             # === STEG 2: OCR MED SIGNED URL ===
             # Notera: document_annotation_format har 8-sidors begränsning
@@ -329,16 +338,15 @@ async def extract_pdf_multi_pass_mistral(
 
             full_text = "\n\n".join(pages_markdown)
 
-            if not quiet:
-                chart_info = f" | {len(extracted_charts)} grafer" if extracted_charts else ""
-                print(f"   OCR: {ocr_elapsed:.1f}s | {num_pages} sidor | {len(full_text)} tecken{chart_info}", flush=True)
+            chart_info = f" | {len(extracted_charts)} grafer" if extracted_charts else ""
+            logger.info(f"[OCR] Klar: {ocr_elapsed:.1f}s | {num_pages} sidor | {len(full_text)} tecken{chart_info}")
+            log_api_request(MISTRAL_OCR, "ocr", 0, 0)
 
             # === STEG 3: LLM STRUKTURERING ===
             if progress_callback:
                 progress_callback(pdf_path, "llm", None)
 
-            if not quiet:
-                print(f"   [LLM] Strukturerar med {MISTRAL_LLM}...", flush=True)
+            logger.debug(f"[LLM] Strukturerar med {MISTRAL_LLM}...")
 
             llm_start = time.perf_counter()
 
@@ -371,8 +379,8 @@ async def extract_pdf_multi_pass_mistral(
             input_tokens = usage.prompt_tokens if usage else 0
             output_tokens = usage.completion_tokens if usage else 0
 
-            if not quiet:
-                print(f"   LLM: {llm_elapsed:.1f}s | {input_tokens} in / {output_tokens} out tokens", flush=True)
+            logger.info(f"[LLM] Klar: {llm_elapsed:.1f}s | {input_tokens} in / {output_tokens} ut tokens")
+            log_api_request(MISTRAL_LLM, "structure", input_tokens, output_tokens)
 
             # Hämta strukturerad output
             parsed_result = llm_response.choices[0].message.parsed
@@ -399,11 +407,7 @@ async def extract_pdf_multi_pass_mistral(
             section_count = len(sections)
             chart_count = len(charts)
 
-            if not quiet:
-                print("\n   [RESULTAT]", flush=True)
-                print(f"      Tabeller: {table_count} st", flush=True)
-                print(f"      Sektioner: {section_count} st", flush=True)
-                print(f"      Grafer: {chart_count} st", flush=True)
+            logger.info(f"[RESULTAT] Tabeller: {table_count} | Sektioner: {section_count} | Grafer: {chart_count}")
 
             # Hämta metadata
             metadata = result.get("metadata", {})
@@ -440,10 +444,7 @@ async def extract_pdf_multi_pass_mistral(
             }
 
             # Sammanfattning
-            if not quiet:
-                print(f"\n   --- {filename} KLAR (Mistral 2-step) ---")
-                print(f"   Tid: {total_elapsed:.1f}s | Sidor: {num_pages} | Kostnad: {cost:.4f} SEK")
-                print(f"   Tabeller: {table_count} | Sektioner: {section_count} | Grafer: {chart_count}")
+            log_extraction_complete(pdf_path, table_count, section_count, chart_count, cost, total_elapsed)
 
             # Ingen validering i Mistral-pipelinen (saknar Pass 1-struktur)
             all_errors = []
@@ -458,11 +459,10 @@ async def extract_pdf_multi_pass_mistral(
                 try:
                     from supabase_client import generate_embeddings_for_sections_async
                     embeddings_count = await generate_embeddings_for_sections_async(section_ids)
-                    if embeddings_count > 0 and not quiet:
-                        print(f"   [EMBEDDING] {embeddings_count} sections har fått embeddings")
+                    if embeddings_count > 0:
+                        logger.info(f"[EMBEDDING] {embeddings_count}/{len(section_ids)} sektioner fick embeddings")
                 except Exception as emb_err:
-                    if not quiet:
-                        print(f"   [EMBEDDING] Kunde inte generera embeddings: {emb_err}")
+                    logger.warning(f"[EMBEDDING] Kunde inte generera embeddings: {emb_err}")
 
             # Uppdatera slutstatus
             update_period_status(
@@ -471,6 +471,14 @@ async def extract_pdf_multi_pass_mistral(
                 errors=all_errors if all_errors else None,
                 embeddings_count=embeddings_count
             )
+
+            # Flytta fil och uppdatera logg
+            if base_folder:
+                try:
+                    process_extraction_complete(pdf_path, company_name, base_folder)
+                    logger.info(f"[FIL] PDF flyttad till ligger_i_databasen/")
+                except Exception as move_err:
+                    logger.warning(f"[FIL] Kunde inte flytta PDF: {move_err}")
 
             if progress_callback:
                 progress_callback(pdf_path, "done", {
@@ -505,17 +513,13 @@ async def extract_pdf_multi_pass_mistral(
                     pass
 
             if attempt < MAX_RETRIES - 1:
-                if not quiet:
-                    print(f"\n[VARNING] Fel vid extraktion av {filename}:")
-                    print(f"   {type(e).__name__}: {e}")
-                    print(f"   Retry {attempt + 1}/{MAX_RETRIES}...")
-                    wait_time = 2 ** attempt
-                    print(f"   Väntar {wait_time}s innan retry...")
-                else:
-                    wait_time = 2 ** attempt
+                wait_time = 2 ** attempt
+                logger.warning(f"[RETRY] Fel vid extraktion av {filename}: {type(e).__name__}: {e}")
+                logger.warning(f"[RETRY] Försök {attempt + 1}/{MAX_RETRIES}, väntar {wait_time}s...")
                 uploaded_file_id = None  # Reset för retry
                 await asyncio.sleep(wait_time)
             else:
+                logger.error(f"[FEL] Extraktion misslyckades efter {MAX_RETRIES} försök: {e}")
                 if progress_callback:
                     progress_callback(pdf_path, f"failed: {e}", None)
                 raise

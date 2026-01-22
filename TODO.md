@@ -142,6 +142,52 @@ Supabase Storage lagrar filer i molnet istället för lokalt på servern:
 
 ---
 
+### 7. Mistral Pipeline - Förbättringar
+
+#### API-uppdateringar
+- [ ] **Uppgradera till Mistral OCR 3** (`mistral-ocr-2512`)
+  - 74% bättre precision på formulär, skannade dokument, komplexa tabeller
+  - Bättre handskriftsigenkänning
+  - HTML-tabeller med `rowspan`/`colspan`
+  - Pris: $2/1000 sidor (50% rabatt med Batch API)
+
+- [ ] **Spara bounding boxes** för tabeller/grafer i databasen
+  - Koordinater för att visa var data kommer från i PDF
+  - Användbart för verifiering och debugging
+
+- [ ] **Lägg till confidence scores** från OCR
+  - Kvalitetsindikator per extraherat element
+
+#### Databaslagring (flytta från lokal till Supabase)
+- [ ] **Flytta loggar till Supabase**
+  - Skapa `extraction_logs`-tabell
+  - Spara strukturerade loggar per period/extraktion
+  - Ta bort lokala `.log`-filer
+
+- [ ] **Flytta graf-bilder till Supabase Storage**
+  - Bucket: `charts/{company_slug}/{period}/`
+  - Uppdatera `charts`-tabellen med storage URL istället för lokal path
+  - Ta bort lokal lagring i `ligger_i_databasen/`
+
+**Förslag på databasschema för loggar:**
+```sql
+CREATE TABLE extraction_logs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  period_id UUID REFERENCES periods(id),
+  company_id UUID REFERENCES companies(id),
+  log_level TEXT NOT NULL,           -- DEBUG, INFO, WARNING, ERROR
+  module TEXT,                       -- pipeline_mistral_v2, pixtral, etc.
+  message TEXT NOT NULL,
+  timestamp TIMESTAMPTZ DEFAULT now(),
+  metadata JSONB                     -- Extra data (tokens, cost, etc.)
+);
+
+CREATE INDEX idx_extraction_logs_period ON extraction_logs(period_id);
+CREATE INDEX idx_extraction_logs_timestamp ON extraction_logs(timestamp);
+```
+
+---
+
 ## Redan klart
 
 - [x] FastAPI backend med alla endpoints

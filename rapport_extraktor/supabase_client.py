@@ -15,6 +15,8 @@ import requests
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
+from logger import get_logger, log_embedding_progress
+
 # Thread pool för parallella DB-operationer
 _db_executor = ThreadPoolExecutor(max_workers=4)
 
@@ -230,15 +232,14 @@ def save_period(company_id: str, data: dict, pdf_hash: str | None = None, source
     period_id, section_ids = save_period_atomic(company_id, data, pdf_hash, source_file)
 
     # Generera embeddings för sections automatiskt
+    logger = get_logger('supabase')
     if section_ids:
         try:
             num_embeddings = generate_embeddings_for_sections(section_ids)
-            if num_embeddings > 0:
-                print(f"   [EMBEDDING] {num_embeddings} sections har fatt embeddings")
             # Uppdatera embeddings_count
             update_period_status(period_id, embeddings_count=num_embeddings)
         except Exception as e:
-            print(f"   [EMBEDDING] Kunde inte generera embeddings: {e}")
+            logger.warning(f"[EMBEDDING] Kunde inte generera embeddings: {e}")
             # Fortsätt ändå - embeddings kan genereras senare
 
     return period_id
@@ -953,7 +954,7 @@ def get_voyage_embeddings(texts: list[str], max_retries: int = 5) -> list[list[f
 
 def generate_embeddings_for_sections(section_ids: list[str]) -> int:
     """
-    Generera embeddings för specifika sections.
+    Generera embeddings för specifika sections med loggning.
 
     Args:
         section_ids: Lista med section UUIDs
@@ -964,6 +965,7 @@ def generate_embeddings_for_sections(section_ids: list[str]) -> int:
     if not section_ids:
         return 0
 
+    logger = get_logger('embeddings')
     client = get_client()
 
     # Hämta sections
@@ -971,14 +973,20 @@ def generate_embeddings_for_sections(section_ids: list[str]) -> int:
     sections = result.data
 
     if not sections:
+        logger.warning("[EMBEDDING] Inga sektioner hittades för angivna IDs")
         return 0
 
     # Processa i batchar om 10
     batch_size = 10
     total_processed = 0
+    total_failed = 0
+    num_batches = (len(sections) + batch_size - 1) // batch_size
+
+    logger.info(f"[EMBEDDING] Genererar embeddings för {len(sections)} sektioner ({num_batches} batchar)")
 
     for i in range(0, len(sections), batch_size):
         batch = sections[i:i + batch_size]
+        batch_num = i // batch_size + 1
 
         # Kombinera title + content för bättre embedding
         texts = [f"{s['title']}\n\n{s['content']}" for s in batch]
@@ -993,14 +1001,25 @@ def generate_embeddings_for_sections(section_ids: list[str]) -> int:
                 }).eq("id", section["id"]).execute()
                 total_processed += 1
 
+            logger.debug(f"[EMBEDDING] Batch {batch_num}/{num_batches}: {len(batch)} sektioner OK")
+            log_embedding_progress(total_processed, len(sections), batch_num, success=True)
+
             # Paus mellan batchar för att undvika rate limit
             if i + batch_size < len(sections):
                 time.sleep(1)
 
         except Exception as e:
-            print(f"    [EMBEDDING] Fel vid batch: {e}")
+            total_failed += len(batch)
+            logger.warning(f"[EMBEDDING] Batch {batch_num}/{num_batches} FEL: {e}")
+            log_embedding_progress(total_processed, len(sections), batch_num, success=False)
             # Fortsätt med nästa batch istället för att avbryta
             continue
+
+    # Slutrapport
+    if total_failed > 0:
+        logger.warning(f"[EMBEDDING] Klart med varningar: {total_processed} OK, {total_failed} misslyckade")
+    else:
+        logger.info(f"[EMBEDDING] Klart: {total_processed}/{len(sections)} sektioner fick embeddings")
 
     return total_processed
 

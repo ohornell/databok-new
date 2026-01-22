@@ -575,15 +575,42 @@ def populate_dynamic_table_sheet(
 
         # Kolumnrubriker från tabellen
         columns = table.get("columns", [])
-        # Första kolumnen är tom (för radnamn), resten är värdekolumner
-        # Hoppa över första kolumnen om den är tom/bara beskrivning
-        value_columns = columns[1:] if columns and columns[0] in ["", "MSEK", "TSEK", "SEK"] else columns
+        rows = table.get("rows", [])
 
-        # Filtrera bort "Not"/"Note"-kolumner (inte numeriska värden)
-        # not_col_indices är relativt till value_columns (som börjar efter label-kolumnen)
-        not_col_indices = set(i for i, c in enumerate(value_columns) if str(c).lower() in ["not", "note", "notes"])
-        if not_col_indices:
-            value_columns = [c for i, c in enumerate(value_columns) if i not in not_col_indices]
+        # Definiera enhets-/valuta-kolumner som ofta finns i headers men saknar data
+        unit_columns = {"nokm", "nok", "msek", "tsek", "sek", "eur", "usd", "meur", "musd", "mnok"}
+        note_columns = {"not", "note", "notes"}
+        skip_column_names = unit_columns | note_columns
+
+        # Hoppa över första kolumnen om den är tom/bara beskrivning
+        if columns and str(columns[0]).lower().strip() in ["", *unit_columns]:
+            value_columns = columns[1:]
+            first_col_was_label = True
+        else:
+            value_columns = columns
+            first_col_was_label = False
+
+        # Hitta index för kolumner att hoppa över (enheter/noter)
+        skip_col_indices = set()
+        for i, c in enumerate(value_columns):
+            col_str = str(c).lower().strip()
+            if col_str in skip_column_names:
+                skip_col_indices.add(i)
+
+        # Filtrera bort dessa kolumner från headers
+        if skip_col_indices:
+            value_columns = [c for i, c in enumerate(value_columns) if i not in skip_col_indices]
+
+        # Avgör om values-arrayen har motsvarande enhetskolumn-värden eller inte
+        # Om len(values)-1 == len(columns)-1 (exkl. label), då finns alla värden
+        # Om len(values)-1 < len(columns)-1, då saknas värden för enhetskolumner
+        sample_row = rows[0] if rows else {}
+        sample_values = sample_row.get("values", [])
+        num_value_cols_in_header = len(columns) - 1 if first_col_was_label else len(columns)
+        num_values_in_data = len(sample_values) - 1 if sample_values else 0
+
+        # Om data har färre värden än headers, hoppa inte över värden (bara headers)
+        values_have_unit_columns = (num_values_in_data >= num_value_cols_in_header)
 
         # Header-rad
         ws.cell(row=current_row, column=1, value="").font = HEADER_FONT
@@ -599,8 +626,7 @@ def populate_dynamic_table_sheet(
 
         current_row += 1
 
-        # Data-rader
-        rows = table.get("rows", [])
+        # Data-rader (rows redan hämtad ovan för sample)
         num_cols = len(value_columns) + 1
 
         for row_data in rows:
@@ -611,10 +637,16 @@ def populate_dynamic_table_sheet(
             # Radnamn
             ws.cell(row=current_row, column=1, value=label)
 
-            # Värden - hoppa över Not-kolumnens index
-            # values[0] är alltid null (label), values[1:] motsvarar value_columns innan filtrering
-            # Vi måste filtrera values[1:] med samma not_col_indices
-            filtered_values = [v for i, v in enumerate(values[1:]) if i not in not_col_indices] if not_col_indices else values[1:]
+            # Värden - hantera skillnaden mellan headers och values
+            # values[0] är alltid label, values[1:] är faktiska värden
+            # Om values-arrayen har färre element än headers (enhetskolumner saknas i data),
+            # filtrera INTE värden, bara headers
+            if skip_col_indices and values_have_unit_columns:
+                # Values har motsvarande enhetskolumner - filtrera bort dem
+                filtered_values = [v for i, v in enumerate(values[1:]) if i not in skip_col_indices]
+            else:
+                # Values saknar enhetskolumner - använd alla värden direkt
+                filtered_values = values[1:]
             for val_idx, value in enumerate(filtered_values):
                 if val_idx + 2 <= num_cols:
                     ws.cell(row=current_row, column=val_idx + 2, value=value)

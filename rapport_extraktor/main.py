@@ -24,6 +24,7 @@ Användning:
 
 import argparse
 import asyncio
+import gc
 import sys
 import time
 from pathlib import Path
@@ -35,6 +36,15 @@ from pipeline_mistral import extract_pdf_multi_pass_mistral, get_mistral_client
 from pipeline_mistral_v2 import extract_pdf_mistral_v2, get_mistral_client as get_mistral_client_v2
 from excel_builder import build_databook
 from supabase_client import list_companies, get_or_create_company, slugify, check_database_setup, load_all_periods
+from logger import setup_logger, get_logger
+from checkpoint import (
+    generate_batch_id,
+    save_checkpoint,
+    get_completed_files,
+    add_completed_file,
+    add_failed_file,
+    get_batch_progress,
+)
 
 # Ladda miljövariabler
 load_dotenv()
@@ -47,20 +57,49 @@ async def extract_all_pdfs_mistral(
     use_cache: bool = True,
     base_folder: str | None = None,
     quiet: bool = False,
+    resume: bool = False,
+    batch_size: int = 5,
 ) -> tuple[list[dict], list[tuple[str, str]]]:
     """
-    Wrapper för Mistral-pipelinen med samma interface som Claude-pipelinen.
+    Wrapper för Mistral-pipelinen med checkpoint-stöd.
+
+    Args:
+        pdf_paths: Lista med PDF-sökvägar
+        company_name: Bolagsnamn
+        progress_callback: Callback för progress-uppdateringar
+        use_cache: Använd cache om PDF redan extraherats
+        base_folder: Basmapp för fillagring
+        quiet: Undertryck utskrifter
+        resume: Återuppta från checkpoint om True
+        batch_size: Antal PDFs per batch
     """
     from supabase_client import get_or_create_company
 
     company = get_or_create_company(company_name)
+    logger = get_logger('batch_mistral')
+
+    # Setup logger om base_folder finns
+    if base_folder:
+        setup_logger(company_name, base_folder)
+
+    # Checkpoint-hantering
+    batch_id = generate_batch_id(company["id"])
+    if resume:
+        completed = get_completed_files(batch_id)
+        original_count = len(pdf_paths)
+        pdf_paths = [p for p in pdf_paths if str(p) not in completed]
+        if original_count != len(pdf_paths):
+            logger.info(f"[CHECKPOINT] Återupptar batch - hoppar över {original_count - len(pdf_paths)} redan extraherade")
+
     client = get_mistral_client()
     semaphore = asyncio.Semaphore(2)  # Max 2 parallella anrop
 
     successful = []
     failed = []
 
-    for pdf_path in pdf_paths:
+    logger.info(f"[BATCH] Startar extraktion av {len(pdf_paths)} PDFs med Mistral v1")
+
+    for i, pdf_path in enumerate(pdf_paths):
         try:
             result = await extract_pdf_multi_pass_mistral(
                 pdf_path=pdf_path,
@@ -74,11 +113,24 @@ async def extract_all_pdfs_mistral(
                 quiet=quiet,
             )
             successful.append(result)
+            add_completed_file(batch_id, str(pdf_path))
+            logger.info(f"[BATCH] {i+1}/{len(pdf_paths)} klar: {Path(pdf_path).name}")
         except Exception as e:
             failed.append((pdf_path, str(e)))
+            add_failed_file(batch_id, str(pdf_path), str(e))
+            logger.error(f"[BATCH] {i+1}/{len(pdf_paths)} FEL: {Path(pdf_path).name} - {e}")
             if progress_callback:
                 progress_callback(pdf_path, f"failed: {e}", None)
 
+        # Minnesrensning var 5:e fil
+        if (i + 1) % batch_size == 0:
+            gc.collect()
+
+    # Spara slutlig checkpoint
+    save_checkpoint(batch_id, [str(p) for p in pdf_paths if any(r.get("_source_file") == str(p) for r in successful)],
+                   [{"path": p, "error": e} for p, e in failed], len(pdf_paths))
+
+    logger.info(f"[BATCH] Klart! {len(successful)} lyckade, {len(failed)} misslyckade")
     return successful, failed
 
 
@@ -89,21 +141,50 @@ async def extract_all_pdfs_mistral_v2(
     use_cache: bool = True,
     base_folder: str | None = None,
     quiet: bool = False,
+    resume: bool = False,
+    batch_size: int = 5,
 ) -> tuple[list[dict], list[tuple[str, str]]]:
     """
-    Wrapper för Mistral v2-pipelinen (sidvis bearbetning med annotations).
+    Wrapper för Mistral v2-pipelinen med checkpoint-stöd.
     Snabbare än v1 - kringgår 8-sidorsbegränsningen.
+
+    Args:
+        pdf_paths: Lista med PDF-sökvägar
+        company_name: Bolagsnamn
+        progress_callback: Callback för progress-uppdateringar
+        use_cache: Använd cache om PDF redan extraherats
+        base_folder: Basmapp för fillagring
+        quiet: Undertryck utskrifter
+        resume: Återuppta från checkpoint om True
+        batch_size: Antal PDFs per batch
     """
     from supabase_client import get_or_create_company
 
     company = get_or_create_company(company_name)
+    logger = get_logger('batch_mistral_v2')
+
+    # Setup logger om base_folder finns
+    if base_folder:
+        setup_logger(company_name, base_folder)
+
+    # Checkpoint-hantering
+    batch_id = generate_batch_id(company["id"])
+    if resume:
+        completed = get_completed_files(batch_id)
+        original_count = len(pdf_paths)
+        pdf_paths = [p for p in pdf_paths if str(p) not in completed]
+        if original_count != len(pdf_paths):
+            logger.info(f"[CHECKPOINT] Återupptar batch - hoppar över {original_count - len(pdf_paths)} redan extraherade")
+
     client = get_mistral_client_v2()
     semaphore = asyncio.Semaphore(2)  # Max 2 parallella PDFs
 
     successful = []
     failed = []
 
-    for pdf_path in pdf_paths:
+    logger.info(f"[BATCH] Startar extraktion av {len(pdf_paths)} PDFs med Mistral v2")
+
+    for i, pdf_path in enumerate(pdf_paths):
         try:
             result = await extract_pdf_mistral_v2(
                 pdf_path=pdf_path,
@@ -117,11 +198,24 @@ async def extract_all_pdfs_mistral_v2(
                 quiet=quiet,
             )
             successful.append(result)
+            add_completed_file(batch_id, str(pdf_path))
+            logger.info(f"[BATCH] {i+1}/{len(pdf_paths)} klar: {Path(pdf_path).name}")
         except Exception as e:
             failed.append((pdf_path, str(e)))
+            add_failed_file(batch_id, str(pdf_path), str(e))
+            logger.error(f"[BATCH] {i+1}/{len(pdf_paths)} FEL: {Path(pdf_path).name} - {e}")
             if progress_callback:
                 progress_callback(pdf_path, f"failed: {e}", None)
 
+        # Minnesrensning var 5:e fil
+        if (i + 1) % batch_size == 0:
+            gc.collect()
+
+    # Spara slutlig checkpoint
+    save_checkpoint(batch_id, [str(p) for p in pdf_paths if any(r.get("_source_file") == str(p) for r in successful)],
+                   [{"path": p, "error": e} for p, e in failed], len(pdf_paths))
+
+    logger.info(f"[BATCH] Klart! {len(successful)} lyckade, {len(failed)} misslyckade")
     return successful, failed
 
 
@@ -483,7 +577,7 @@ def run_interactive_mode(pdf_path: str | None = None, model: str = "claude"):
         print("\nVälj extraktionsmodell:")
         print("   1) Claude (Haiku + Sonnet + Haiku) - Standard")
         print("   2) Mistral (OCR + Mistral Large)")
-        print("   3) Mistral v2 (Sidvis annotations) - Snabbast!")
+        print("   3) Mistral v2 (OCR + Pixtral) - Snabbast!")
         pipeline_choice = input("\n> ").strip()
         if pipeline_choice == "2":
             model = "mistral"
@@ -606,7 +700,7 @@ def run_interactive_mode(pdf_path: str | None = None, model: str = "claude"):
         if model == "mistral":
             print("\nAnvänder Mistral pipeline (OCR + Mistral Large)")
         elif model == "mistral_v2":
-            print("\nAnvänder Mistral v2 pipeline (Sidvis annotations)")
+            print("\nAnvänder Mistral v2 pipeline (OCR + Pixtral)")
         else:
             print("\nAnvänder Claude pipeline (Haiku + Sonnet + Haiku)")
 
@@ -1297,7 +1391,7 @@ Exempel:
             )
         )
     elif args.model == "mistral_v2":
-        print("🔄 Mistral v2 pipeline (Sidvis annotations)")
+        print("🔄 Mistral v2 pipeline (OCR + Pixtral)")
         successful, failed = asyncio.run(
             extract_all_pdfs_mistral_v2(
                 pdf_path_strs,
