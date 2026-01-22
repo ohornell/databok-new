@@ -669,6 +669,150 @@ def sammanfoga_resultat(alla_resultat: list[dict]) -> dict:
 
 
 # ============================================
+# PIXTRAL GRAF-DATAEXTRAKTION
+# ============================================
+
+# Pixtral modell för bildanalys
+PIXTRAL_MODEL = "pixtral-12b-2409"  # Eller "pixtral-large-latest" för bättre precision
+MAX_PARALLEL_PIXTRAL = 3  # Max parallella Pixtral-anrop
+
+
+async def extract_chart_data_with_pixtral(
+    client: Mistral,
+    chart: dict,
+    semaphore: asyncio.Semaphore,
+    quiet: bool = False,
+) -> dict:
+    """
+    Använd Pixtral för att extrahera datapunkter från en grafbild.
+
+    Args:
+        client: Mistral-klient
+        chart: Dict med chart data inkl. image_base64
+        semaphore: Semaphore för rate limiting
+        quiet: Undertryck utskrifter
+
+    Returns:
+        chart dict med populerat data_points
+    """
+    image_base64 = chart.get("image_base64", "")
+    if not image_base64:
+        return chart
+
+    # Formatera base64 för API
+    if not image_base64.startswith("data:"):
+        image_base64 = f"data:image/png;base64,{image_base64}"
+
+    chart_type = chart.get("chart_type", "bar")
+    title = chart.get("title", "")
+
+    # Prompt anpassad för grafer
+    system_prompt = """Du är en expert på att extrahera data från finansiella grafer.
+Analysera grafbilden och returnera strukturerad JSON med datapunkter.
+
+Returnera ENDAST giltig JSON i detta format:
+{
+  "data_points": [
+    {"label": "Q1 2024", "value": 850},
+    {"label": "Q2 2024", "value": 920}
+  ],
+  "x_axis": "Kvartal",
+  "y_axis": "MSEK",
+  "estimated": true
+}
+
+Regler:
+- Extrahera ALLA synliga datapunkter
+- Använd exakta värden om synliga, annars uppskatta från axeln
+- Sätt estimated=true om värden är uppskattade
+- För cirkeldiagram: label=kategori, value=procent
+- För stapeldiagram: label=x-axel etikett, value=stapelhöjd
+- För linjediagram: label=x-axel punkt, value=y-värde"""
+
+    user_prompt = f"""Analysera denna {chart_type}-graf med titeln "{title}".
+Extrahera alla datapunkter du kan se i grafen."""
+
+    loop = asyncio.get_event_loop()
+
+    async with semaphore:
+        try:
+            response = await loop.run_in_executor(
+                None,
+                partial(
+                    client.chat.complete,
+                    model=PIXTRAL_MODEL,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": user_prompt},
+                                {"type": "image_url", "image_url": image_base64}
+                            ]
+                        }
+                    ],
+                    response_format={"type": "json_object"},
+                    max_tokens=1000,
+                )
+            )
+
+            # Parsa JSON-svar
+            result = json.loads(response.choices[0].message.content)
+
+            # Uppdatera chart med extraherade data
+            chart["data_points"] = result.get("data_points", [])
+            chart["x_axis"] = result.get("x_axis")
+            chart["y_axis"] = result.get("y_axis")
+            chart["estimated"] = result.get("estimated", True)
+
+        except Exception as e:
+            if not quiet:
+                print(f"   [VARNING] Pixtral kunde inte analysera graf '{title}': {e}")
+            # Behåll tom data_points vid fel
+            chart["data_points"] = []
+
+    return chart
+
+
+async def analyze_charts_with_pixtral(
+    client: Mistral,
+    charts: list[dict],
+    quiet: bool = False,
+) -> list[dict]:
+    """
+    Analysera alla grafer med Pixtral för att extrahera datapunkter.
+
+    Args:
+        client: Mistral-klient
+        charts: Lista med grafer (med image_base64)
+        quiet: Undertryck utskrifter
+
+    Returns:
+        Lista med grafer med populerade data_points
+    """
+    if not charts:
+        return charts
+
+    if not quiet:
+        print(f"   [PIXTRAL] Analyserar {len(charts)} grafer för datapunkter...", flush=True)
+
+    semaphore = asyncio.Semaphore(MAX_PARALLEL_PIXTRAL)
+
+    # Analysera alla grafer parallellt
+    analyzed_charts = await asyncio.gather(*[
+        extract_chart_data_with_pixtral(client, chart, semaphore, quiet)
+        for chart in charts
+    ])
+
+    # Räkna lyckade extraktioner
+    successful = sum(1 for c in analyzed_charts if c.get("data_points"))
+    if not quiet:
+        print(f"   [PIXTRAL] {successful}/{len(charts)} grafer fick datapunkter", flush=True)
+
+    return list(analyzed_charts)
+
+
+# ============================================
 # GRAFLAGRING (MILJÖBASERAD)
 # ============================================
 
@@ -850,6 +994,18 @@ async def extract_pdf_mistral_v2(
 
         # Beräkna kostnad
         cost = num_pages * OCR_PRICE_PER_PAGE * USD_TO_SEK
+
+        # === STEG 4.5: ANALYSERA GRAFER MED PIXTRAL ===
+        if sammanfogat.get("charts"):
+            pixtral_start = time.perf_counter()
+            sammanfogat["charts"] = await analyze_charts_with_pixtral(
+                client=client,
+                charts=sammanfogat["charts"],
+                quiet=quiet,
+            )
+            pixtral_elapsed = time.perf_counter() - pixtral_start
+            if not quiet:
+                print(f"   Pixtral klar: {pixtral_elapsed:.1f}s", flush=True)
 
         # === STEG 5: SPARA GRAFER ===
         period = sammanfogat["metadata"].get("period", "")
