@@ -598,6 +598,116 @@ async def bearbeta_alla_sidor(
 
 
 # ============================================
+# NORMALISERA TABELLSTRUKTUR
+# ============================================
+
+def is_period_header(value: str) -> bool:
+    """
+    Detektera om ett värde ser ut som en period-header.
+    Skalbar lösning som hanterar många format.
+
+    Stödda format:
+    - Kvartal: Q1 2024, Q3 24, 1Q24, 3Q 2024, Kv1 2024
+    - Halvår: H1 2024, 1H 2024, H1'24
+    - Helår: 2024, FY2024, FY 2024, Full year 2024
+    - YTD: YTD 2024, 9M 2024, 9M24
+    - LTM/TTM: LTM, TTM, LTM Q3 2024
+    - Månader: Jan-Mar 2024, January-March 2024, Jul-Sep 2024
+    - Nordiska: Kv1 2024, Kv 1 2024
+    """
+    import re
+
+    if not value:
+        return False
+
+    v = str(value).strip()
+
+    # Lista med mönster (ordnade efter specificitet)
+    patterns = [
+        # Kvartal: Q1 2024, Q3 24, Q1'24, Q1-24
+        r'^Q[1-4]\s*[\'/-]?\s*\d{2,4}$',
+        # Kvartal omvänt: 1Q24, 3Q 2024, 1Q'24
+        r'^[1-4]Q\s*[\'/-]?\s*\d{2,4}$',
+        # Halvår: H1 2024, H2 24, 1H 2024, 1H24
+        r'^[12]?H[12]?\s*[\'/-]?\s*\d{2,4}$',
+        # YTD med månad: 9M 2024, 9M24, 3M 2024
+        r'^\d{1,2}M\s*[\'/-]?\s*\d{2,4}$',
+        # YTD: YTD 2024, YTD24, YTD Q3 2024
+        r'^YTD\s*[Q]?\d*\s*\d{2,4}$',
+        # LTM/TTM: LTM, TTM, LTM 2024, LTM Q3 2024
+        r'^[LT]TM(\s+Q?[1-4]?\s*\d{0,4})?$',
+        # Helår: FY2024, FY 2024, FY24
+        r'^FY\s*\d{2,4}$',
+        # Helår text: Full year 2024, Helår 2024
+        r'^(Full\s*year|Helår|Hele\s*året)\s+\d{4}$',
+        # Bara årtal: 2020-2030
+        r'^20[2-3]\d$',
+        # Månad-intervall engelska: Jan-Mar 2024, January-March 2024
+        r'^[A-Za-z]{3,9}[\s-]+[A-Za-z]{3,9}\s+\d{4}$',
+        # Månad-intervall svenska/norska: Jan-mars 2024, Juli-september 2024
+        r'^[A-Za-zåäöÅÄÖ]{3,10}[\s-]+[A-Za-zåäöÅÄÖ]{3,10}\s+\d{4}$',
+        # Nordiska kvartal: Kv1 2024, Kv 1 2024, Kvartal 1 2024
+        r'^Kv(artal)?\s*[1-4]\s+\d{4}$',
+    ]
+
+    for pattern in patterns:
+        if re.match(pattern, v, re.IGNORECASE):
+            return True
+
+    return False
+
+
+def normalize_table_structure(table: dict) -> dict:
+    """
+    Normalisera tabellstruktur där perioder ligger i första radens values
+    istället för i columns.
+
+    Problem: OCR extraherar ibland tabeller så här:
+        columns = ['Income statement']
+        rows[0] = {"label": "NOKm", "values": ["Q3 2023", "Q4 2023", ...]}
+
+    Detta fixar till:
+        columns = ['NOKm', 'Q3 2023', 'Q4 2023', ...]
+        rows = [{"label": "Revenues", "values": ["356", "545", ...]}, ...]
+
+    Returns:
+        Normaliserad tabell
+    """
+    columns = table.get("columns", [])
+    rows = table.get("rows", [])
+
+    # Kolla om första raden innehåller period-headers
+    if not rows:
+        return table
+
+    first_row = rows[0]
+    first_values = first_row.get("values", [])
+
+    if not first_values:
+        return table
+
+    # Räkna hur många values som ser ut som perioder
+    period_matches = sum(1 for v in first_values if is_period_header(v))
+
+    # Om minst 3 värden ELLER >50% av värdena matchar period-mönster
+    min_matches = min(3, len(first_values) // 2 + 1)
+    if period_matches >= min_matches:
+        # Bygg nya columns från label + values i första raden
+        new_columns = [first_row.get("label", "")] + list(first_values)
+
+        # Ta bort första raden från rows
+        new_rows = rows[1:]
+
+        return {
+            **table,
+            "columns": new_columns,
+            "rows": new_rows,
+        }
+
+    return table
+
+
+# ============================================
 # SAMMANFOGA RESULTAT FRÅN ALLA SIDOR
 # ============================================
 
@@ -640,11 +750,13 @@ def sammanfoga_resultat(alla_resultat: list[dict]) -> dict:
         if markdown:
             full_text_parts.append(f"--- Sida {page_num} ---\n{markdown}")
 
-    # Samla alla tabeller
+    # Samla alla tabeller och normalisera strukturen
     tables = []
     for result in alla_resultat:
         for table in result.get("tables", []):
-            tables.append(table)
+            # Normalisera tabeller där perioder ligger i första radens values
+            normalized_table = normalize_table_structure(table)
+            tables.append(normalized_table)
 
     # Samla alla grafer
     charts = []
